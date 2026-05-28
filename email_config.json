@@ -1,0 +1,11 @@
+{
+  "enabled": true,
+  "smtp_host": "smtp.gmail.com",
+  "smtp_port": 587,
+  "smtp_user": "inficonreminder@gmail.com",
+  "smtp_password": "eypo zium voiy mbus",
+  "from_addr": "inficonreminder@gmail.com",
+  "to_addrs": [
+    "kmageshkumar@ichorsystems.com"
+  ]
+}
