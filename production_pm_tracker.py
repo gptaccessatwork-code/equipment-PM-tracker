@@ -157,10 +157,17 @@ def init_database():
                 alert_threshold_days INTEGER NOT NULL DEFAULT 5,
                 last_performed_date TEXT,
                 next_due_date TEXT,
+                custom_start_date TEXT,
                 created_at TEXT DEFAULT CURRENT_TIMESTAMP,
                 FOREIGN KEY (parent_machine_name) REFERENCES machines(name) ON DELETE CASCADE
             )
         """)
+        
+        # Add custom_start_date column to existing components table if it doesn't exist
+        try:
+            cursor.execute("ALTER TABLE components ADD COLUMN custom_start_date TEXT")
+        except sqlite3.OperationalError:
+            pass  # Column already exists
         
         # Create email_log table to track sent emails
         cursor.execute("""
@@ -216,23 +223,28 @@ class DatabaseManager:
                     except ValueError:
                         pass
                 
+                custom_start = component_data.get('custom_start_date')
+                print(f"Adding component: {component_data['component_name']}, custom_start: {custom_start}")
+                
                 cursor.execute("""
                     INSERT INTO components 
                     (parent_machine_name, component_name, pm_interval_days, 
-                     alert_threshold_days, last_performed_date, next_due_date)
-                    VALUES (?, ?, ?, ?, ?, ?)
+                     alert_threshold_days, last_performed_date, next_due_date, custom_start_date)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
                 """, (
                     machine_name,
                     component_data['component_name'],
                     component_data['pm_interval_days'],
                     component_data['alert_threshold_days'],
                     last_performed,
-                    next_due
+                    next_due,
+                    custom_start
                 ))
                 conn.commit()
                 return True
         except Exception as e:
             print(f"Error adding component: {e}")
+            print(f"Component data: {component_data}")
             return False
     
     @staticmethod
@@ -374,28 +386,7 @@ class DatabaseManager:
             print(f"Error checking email log: {e}")
             return False
     
-    @staticmethod
-    def delete_machine(machine_name: str) -> bool:
-        """Delete a machine and all its components."""
-        try:
-            with sqlite3.connect(get_db_path()) as conn:
-                cursor = conn.cursor()
-                
-                # Delete components (cascade should handle this, but let's be explicit)
-                cursor.execute("""
-                    DELETE FROM components WHERE parent_machine_name = ?
-                """, (machine_name,))
-                
-                # Delete machine
-                cursor.execute("""
-                    DELETE FROM machines WHERE name = ?
-                """, (machine_name,))
-                
-                conn.commit()
-                return True
-        except Exception as e:
-            print(f"Error deleting machine: {e}")
-            return False
+
     
     @staticmethod
     def log_email_sent(sent_date: str, components_count: int, recipients: str) -> bool:
@@ -1399,13 +1390,51 @@ class ComponentInputWidget(QWidget):
         self.alert_input.setValue(5)
         layout.addWidget(self.alert_input, 2, 3)
         
-        self.setLayout(layout)
-        self.setStyleSheet(f"""
-            QWidget {{
-                background-color: transparent;
-                border: none;
+        # Custom start date option
+        from PySide6.QtWidgets import QDateEdit
+        
+        # Custom date edit that disables scroll wheel
+        class NoWheelDateEdit(QDateEdit):
+            def wheelEvent(self, event):
+                event.ignore()
+        
+        self.custom_start_checkbox = QCheckBox("Custom Start Date")
+        self.custom_start_checkbox.setStyleSheet(f"""
+            QCheckBox {{
+                color: {Theme.TEXT_PRIMARY};
+                font-size: 12px;
+            }}
+            QCheckBox::indicator {{
+                width: 18px;
+                height: 18px;
+                border: 2px solid {Theme.TEXT_MUTED};
+                border-radius: 3px;
+                background-color: {Theme.BG_CARD};
+            }}
+            QCheckBox::indicator:hover {{
+                border: 2px solid {Theme.PRIMARY};
+            }}
+            QCheckBox::indicator:checked {{
+                background-color: {Theme.PRIMARY};
+                border: 2px solid {Theme.PRIMARY};
             }}
         """)
+        self.custom_start_date = NoWheelDateEdit()
+        self.custom_start_date.setDate(date.today())
+        self.custom_start_date.setCalendarPopup(True)
+        self.custom_start_date.setVisible(False)
+        self.custom_start_date.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        self.custom_start_checkbox.stateChanged.connect(self._on_custom_start_changed)
+        
+        layout.addWidget(self.custom_start_checkbox, 3, 0, 1, 4)
+        layout.addWidget(self.custom_start_date, 4, 0, 1, 4)
+        
+        self.setLayout(layout)
+        self.setStyleSheet("QWidget { background-color: transparent; border: none; }")
+    
+    def _on_custom_start_changed(self, state):
+        """Handle custom start date checkbox state change."""
+        self.custom_start_date.setVisible(state == 2)  # 2 = checked
     
     def get_data(self) -> Optional[Dict]:
         """Get component data from inputs."""
@@ -1413,12 +1442,21 @@ class ComponentInputWidget(QWidget):
         if not name:
             return None
         
-        return {
+        data = {
             'component_name': name,
             'pm_interval_days': self.interval_input.value(),
             'alert_threshold_days': self.alert_input.value(),
-            'last_performed_date': date.today().isoformat()
         }
+        
+        # Handle custom start date
+        if self.custom_start_checkbox.isChecked():
+            custom_date = self.custom_start_date.date().toPython()
+            data['custom_start_date'] = custom_date.isoformat()
+            data['last_performed_date'] = custom_date.isoformat()
+        else:
+            data['last_performed_date'] = date.today().isoformat()
+        
+        return data
 
 class AddEquipmentDialog(QDialog):
     """Dialog for adding or editing equipment with components."""
@@ -1729,10 +1767,16 @@ class AddEquipmentDialog(QDialog):
         location = self.location_input.text().strip() or None
         components_data = []
         
+        print(f"Saving equipment: {equipment_name}")
+        print(f"Component widgets count: {len(self.component_widgets)}")
+        
         for widget in self.component_widgets:
             data = widget.get_data()
             if data:
                 components_data.append(data)
+                print(f"Component data: {data}")
+        
+        print(f"Total components to save: {len(components_data)}")
         
         if equipment_name and components_data:
             if self.is_edit_mode:
@@ -1753,7 +1797,9 @@ class AddEquipmentDialog(QDialog):
                 if DatabaseManager.add_machine(equipment_name, serial_number, location):
                     # Add components
                     for comp_data in components_data:
-                        DatabaseManager.add_component(equipment_name, comp_data)
+                        if not DatabaseManager.add_component(equipment_name, comp_data):
+                            self._show_error_message("Failed to add component. Please try again.")
+                            return
                     
                     self.accept()
                 else:
@@ -2212,6 +2258,7 @@ class MainWindow(QMainWindow):
         self.cards_container.setStyleSheet("background-color: transparent;")
         self.cards_layout = QGridLayout()
         self.cards_layout.setSpacing(16)
+        self.cards_layout.setAlignment(Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft)
         
         # Set uniform column stretches for consistent grid sizing
         for i in range(3):  # Max 3 columns
@@ -2588,6 +2635,9 @@ class MainWindow(QMainWindow):
                 if widget:
                     widget.deleteLater()
         
+        # Process events to ensure widgets are deleted before adding new ones
+        QApplication.processEvents()
+        
         # Update metrics
         total_equipment = len(machines)
         critical_count = 0
@@ -2623,11 +2673,17 @@ class MainWindow(QMainWindow):
         start_slot = len(machines)
         
         # Calculate how many placeholders we need
-        # If we have equipment, fill the current row, otherwise show minimum grid
+        # If we have equipment, fill the current row AND add one more full row
+        # If no equipment, show minimum grid
         if machines:
             # Complete the current row
-            current_row_start = (len(machines) // self.current_columns) * self.current_columns
-            placeholders_needed = max(current_row_start + self.current_columns - len(machines), self.current_columns)
+            current_row_items = len(machines) % self.current_columns
+            if current_row_items == 0:
+                # Row is already full, add one more full row
+                placeholders_needed = self.current_columns
+            else:
+                # Fill current row and add one more full row
+                placeholders_needed = (self.current_columns - current_row_items) + self.current_columns
         else:
             # Show minimum grid when empty
             placeholders_needed = min_slots
