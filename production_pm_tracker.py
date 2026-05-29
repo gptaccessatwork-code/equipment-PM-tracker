@@ -1424,6 +1424,75 @@ class ComponentInputWidget(QWidget):
         self.custom_start_date.setCalendarPopup(True)
         self.custom_start_date.setVisible(False)
         self.custom_start_date.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        self.custom_start_date.setStyleSheet(f"""
+            QDateEdit {{
+                color: {Theme.TEXT_PRIMARY};
+                background-color: {Theme.BG_INPUT};
+                border: 1px solid {Theme.BORDER};
+                border-radius: 6px;
+                padding: 8px;
+            }}
+            QDateEdit:focus {{
+                border: 1px solid {Theme.BORDER_FOCUS};
+            }}
+            QCalendarWidget QWidget#qt_calendar_navigationbar {{
+                background-color: {Theme.BG_CARD};
+                padding: 4px 8px;
+                min-height: 32px;
+            }}
+            QCalendarWidget QToolButton {{
+                color: {Theme.TEXT_PRIMARY};
+                background-color: transparent;
+                min-width: 28px;
+                min-height: 28px;
+                padding: 4px;
+                margin: 2px;
+                border-radius: 4px;
+                font-size: 14px;
+            }}
+            QCalendarWidget QToolButton#qt_calendar_prevmonth,
+            QCalendarWidget QToolButton#qt_calendar_nextmonth {{
+                min-width: 28px;
+                max-width: 28px;
+                min-height: 28px;
+                max-height: 28px;
+                padding: 2px;
+                qproperty-iconSize: 16px 16px;
+            }}
+            QCalendarWidget QToolButton#qt_calendar_monthbutton,
+            QCalendarWidget QToolButton#qt_calendar_yearbutton {{
+                padding: 4px 16px 4px 8px;
+            }}
+            QCalendarWidget QToolButton#qt_calendar_monthbutton::menu-indicator {{
+                subcontrol-position: center right;
+                subcontrol-origin: padding;
+                right: 2px;
+                width: 10px;
+                height: 10px;
+            }}
+            QCalendarWidget QToolButton:hover {{
+                background-color: {Theme.BG_MUTED};
+            }}
+            QCalendarWidget QMenu {{
+                background-color: {Theme.BG_CARD};
+                color: {Theme.TEXT_PRIMARY};
+            }}
+            QCalendarWidget QSpinBox {{
+                color: {Theme.TEXT_PRIMARY};
+                background-color: {Theme.BG_INPUT};
+                selection-background-color: {Theme.PRIMARY};
+                selection-color: {Theme.TEXT_PRIMARY};
+            }}
+            QCalendarWidget QAbstractItemView:enabled {{
+                color: {Theme.TEXT_PRIMARY};
+                background-color: {Theme.BG_PRIMARY};
+                selection-background-color: {Theme.PRIMARY};
+                selection-color: {Theme.TEXT_PRIMARY};
+            }}
+            QCalendarWidget QAbstractItemView:disabled {{
+                color: {Theme.TEXT_DISABLED};
+            }}
+        """)
         self.custom_start_checkbox.stateChanged.connect(self._on_custom_start_changed)
         
         layout.addWidget(self.custom_start_checkbox, 3, 0, 1, 4)
