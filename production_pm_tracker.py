@@ -2276,7 +2276,7 @@ class MainWindow(QMainWindow):
         # Equipment cards container
         self.scroll_area = QScrollArea()
         self.scroll_area.setWidgetResizable(True)
-        self.scroll_area.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        self.scroll_area.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOn)
         self.scroll_area.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self.scroll_area.setStyleSheet(f"""
             QScrollArea {{
@@ -2343,6 +2343,11 @@ class MainWindow(QMainWindow):
         self.cards_container.setLayout(self.cards_layout)
         self.scroll_area.setWidget(self.cards_container)
         content_layout.addWidget(self.scroll_area, 1)
+        
+        # Match metrics panel margins to cards layout + scrollbar to align columns perfectly
+        margins = self.cards_layout.contentsMargins()
+        # Scrollbar is 8px wide as per stylesheet
+        metrics_panel.layout().setContentsMargins(margins.left(), 0, margins.right() + 8, 0)
         
         # Footer
         footer = self._create_footer()
