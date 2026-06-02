@@ -32,8 +32,8 @@ from PySide6.QtWidgets import (
     QMenu, QProgressBar, QSpinBox, QDoubleSpinBox, QCheckBox,
     QComboBox, QGroupBox, QSplitter, QSpacerItem, QSizePolicy, QAbstractSpinBox
 )
-from PySide6.QtCore import Qt, QTimer, QSize, Signal, QObject, QEvent
-from PySide6.QtGui import QIcon, QPixmap, QColor, QFont, QPalette, QAction
+from PySide6.QtCore import Qt, QTimer, QSize, Signal, QObject, QEvent, QPoint
+from PySide6.QtGui import QIcon, QPixmap, QColor, QFont, QPalette, QAction, QPainter, QPen, QBrush, QPolygon
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  THEME COLORS (Light Theme from Vercel UI)
@@ -85,13 +85,19 @@ def get_db_path():
     """Get the database file path."""
     return os.path.join(get_base_path(), "production_pm_tracker.db")
 
+def get_db_connection():
+    """Open a SQLite connection with foreign keys enabled."""
+    conn = sqlite3.connect(get_db_path())
+    conn.execute("PRAGMA foreign_keys = ON")
+    return conn
+
 def get_email_config_path():
     """Get the email config file path."""
     return os.path.join(get_base_path(), "email_config.json")
 
 def init_database():
     """Initialize the SQLite database with the required schema."""
-    with sqlite3.connect(get_db_path()) as conn:
+    with get_db_connection() as conn:
         cursor = conn.cursor()
         
         # Create machines table without UNIQUE constraint on name
@@ -133,8 +139,8 @@ def init_database():
                 
                 # Rename new table to original name
                 cursor.execute("ALTER TABLE machines_new RENAME TO machines")
-        except Exception as e:
-            print(f"Migration error (non-critical): {e}")
+        except Exception:
+            pass
         
         # Add new columns to existing machines table if they don't exist
         try:
@@ -147,10 +153,11 @@ def init_database():
         except sqlite3.OperationalError:
             pass  # Column already exists 
         
-        # Create components table
+        # Create components table with a real equipment tag
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS components (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+                machine_id INTEGER,
                 parent_machine_name TEXT NOT NULL,
                 component_name TEXT NOT NULL,
                 pm_interval_days INTEGER NOT NULL DEFAULT 30,
@@ -158,16 +165,92 @@ def init_database():
                 last_performed_date TEXT,
                 next_due_date TEXT,
                 custom_start_date TEXT,
+                custom_start_applied_date TEXT,
                 created_at TEXT DEFAULT CURRENT_TIMESTAMP,
-                FOREIGN KEY (parent_machine_name) REFERENCES machines(name) ON DELETE CASCADE
+                FOREIGN KEY (machine_id) REFERENCES machines(id) ON DELETE CASCADE
             )
         """)
-        
-        # Add custom_start_date column to existing components table if it doesn't exist
+
+        # Migrate older component tables that were keyed only by machine name
+        try:
+            cursor.execute("PRAGMA table_info(components)")
+            existing_columns = {row[1] for row in cursor.fetchall()}
+            if existing_columns and "machine_id" not in existing_columns:
+                cursor.execute("ALTER TABLE components RENAME TO components_old")
+                cursor.execute("""
+                    CREATE TABLE components (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        machine_id INTEGER,
+                        parent_machine_name TEXT NOT NULL,
+                        component_name TEXT NOT NULL,
+                        pm_interval_days INTEGER NOT NULL DEFAULT 30,
+                        alert_threshold_days INTEGER NOT NULL DEFAULT 5,
+                        last_performed_date TEXT,
+                        next_due_date TEXT,
+                        custom_start_date TEXT,
+                        custom_start_applied_date TEXT,
+                        created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                        FOREIGN KEY (machine_id) REFERENCES machines(id) ON DELETE CASCADE
+                    )
+                """)
+                cursor.execute("""
+                    INSERT INTO components (
+                        id, machine_id, parent_machine_name, component_name,
+                        pm_interval_days, alert_threshold_days, last_performed_date,
+                        next_due_date, custom_start_date, custom_start_applied_date, created_at
+                    )
+                    SELECT
+                        c.id,
+                        m.id,
+                        c.parent_machine_name,
+                        c.component_name,
+                        c.pm_interval_days,
+                        c.alert_threshold_days,
+                        c.last_performed_date,
+                        c.next_due_date,
+                        c.custom_start_date,
+                        date(c.created_at),
+                        c.created_at
+                    FROM components_old c
+                    LEFT JOIN machines m ON m.name = c.parent_machine_name
+                """)
+                cursor.execute("DROP TABLE components_old")
+        except Exception:
+            pass
+
+        # Add missing columns for existing databases
+        try:
+            cursor.execute("ALTER TABLE components ADD COLUMN machine_id INTEGER")
+        except sqlite3.OperationalError:
+            pass
+
         try:
             cursor.execute("ALTER TABLE components ADD COLUMN custom_start_date TEXT")
         except sqlite3.OperationalError:
             pass  # Column already exists
+
+        try:
+            cursor.execute("ALTER TABLE components ADD COLUMN custom_start_applied_date TEXT")
+        except sqlite3.OperationalError:
+            pass  # Column already exists
+
+        try:
+            cursor.execute("""
+                CREATE INDEX IF NOT EXISTS idx_components_machine_id
+                ON components(machine_id)
+            """)
+        except sqlite3.OperationalError:
+            pass
+
+        try:
+            cursor.execute("""
+                UPDATE components
+                SET custom_start_applied_date = date(created_at)
+                WHERE custom_start_date IS NOT NULL
+                  AND custom_start_applied_date IS NULL
+            """)
+        except sqlite3.OperationalError:
+            pass
         
         # Create email_log table to track one reminder per day
         cursor.execute("""
@@ -219,32 +302,49 @@ class DatabaseManager:
     """Handle all database operations."""
     
     @staticmethod
-    def add_machine(name: str, serial_number: str = None, location: str = None) -> bool:
-        """Add a new machine."""
+    def add_machine(name: str, serial_number: str = None, location: str = None) -> Optional[int]:
+        """Add a new machine and return its database id."""
         try:
-            with sqlite3.connect(get_db_path()) as conn:
+            with get_db_connection() as conn:
                 cursor = conn.cursor()
                 cursor.execute(
                     "INSERT INTO machines (name, serial_number, location) VALUES (?, ?, ?)",
                     (name, serial_number, location)
                 )
                 conn.commit()
-                return True
+                return cursor.lastrowid
         except Exception as e:
             print(f"Error adding machine: {e}")
-            return False
+            return None
     
     @staticmethod
-    def add_component(machine_name: str, component_data: Dict) -> bool:
+    def add_component(machine_id: Optional[int], machine_name: str, component_data: Dict) -> bool:
         """Add a new component to a machine."""
         try:
-            with sqlite3.connect(get_db_path()) as conn:
+            with get_db_connection() as conn:
                 cursor = conn.cursor()
+                if machine_id is None:
+                    cursor.execute("SELECT id FROM machines WHERE name = ? ORDER BY id DESC LIMIT 1", (machine_name,))
+                    result = cursor.fetchone()
+                    machine_id = result[0] if result else None
+                if machine_id is None:
+                    raise ValueError(f"Unable to resolve machine id for '{machine_name}'")
                 
-                # Calculate next due date if last_performed_date is provided
+                # Custom start date uses a one-time phase before the regular interval begins.
                 last_performed = component_data.get('last_performed_date')
                 next_due = None
-                if last_performed:
+                custom_start = component_data.get('custom_start_date')
+                custom_start_applied = component_data.get('custom_start_applied_date')
+
+                if custom_start:
+                    try:
+                        next_due = date.fromisoformat(custom_start).isoformat()
+                    except ValueError:
+                        next_due = custom_start
+                    last_performed = None
+                    if not custom_start_applied:
+                        custom_start_applied = date.today().isoformat()
+                elif last_performed:
                     try:
                         last_date = date.fromisoformat(last_performed)
                         interval = component_data.get('pm_interval_days', 30)
@@ -252,36 +352,33 @@ class DatabaseManager:
                         next_due = next_date.isoformat()
                     except ValueError:
                         pass
-                
-                custom_start = component_data.get('custom_start_date')
-                print(f"Adding component: {component_data['component_name']}, custom_start: {custom_start}")
-                
                 cursor.execute("""
                     INSERT INTO components 
-                    (parent_machine_name, component_name, pm_interval_days, 
-                     alert_threshold_days, last_performed_date, next_due_date, custom_start_date)
-                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                    (machine_id, parent_machine_name, component_name, pm_interval_days, 
+                     alert_threshold_days, last_performed_date, next_due_date, custom_start_date, custom_start_applied_date)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """, (
+                    machine_id,
                     machine_name,
                     component_data['component_name'],
                     component_data['pm_interval_days'],
                     component_data['alert_threshold_days'],
                     last_performed,
                     next_due,
-                    custom_start
+                    custom_start,
+                    custom_start_applied
                 ))
                 conn.commit()
                 return True
         except Exception as e:
             print(f"Error adding component: {e}")
-            print(f"Component data: {component_data}")
             return False
     
     @staticmethod
     def get_all_machines() -> List[Dict]:
         """Get all machines with their components."""
         try:
-            with sqlite3.connect(get_db_path()) as conn:
+            with get_db_connection() as conn:
                 conn.row_factory = sqlite3.Row
                 cursor = conn.cursor()
                 
@@ -294,9 +391,9 @@ class DatabaseManager:
                     # Get components for this machine
                     cursor.execute("""
                         SELECT * FROM components 
-                        WHERE parent_machine_name = ? 
+                        WHERE machine_id = ? OR (machine_id IS NULL AND parent_machine_name = ?)
                         ORDER BY component_name
-                    """, (machine['name'],))
+                    """, (machine['id'], machine['name']))
                     
                     components = []
                     for comp_row in cursor.fetchall():
@@ -331,7 +428,7 @@ class DatabaseManager:
     def reset_component(component_id: int) -> bool:
         """Reset a component's maintenance to today."""
         try:
-            with sqlite3.connect(get_db_path()) as conn:
+            with get_db_connection() as conn:
                 cursor = conn.cursor()
                 
                 # Get component details first
@@ -350,7 +447,7 @@ class DatabaseManager:
                 # Update the component
                 cursor.execute("""
                     UPDATE components 
-                    SET last_performed_date = ?, next_due_date = ?
+                    SET last_performed_date = ?, next_due_date = ?, custom_start_date = NULL, custom_start_applied_date = NULL
                     WHERE id = ?
                 """, (today, next_due, component_id))
                 
@@ -364,7 +461,7 @@ class DatabaseManager:
     def delete_component(component_id: int) -> bool:
         """Delete a specific component."""
         try:
-            with sqlite3.connect(get_db_path()) as conn:
+            with get_db_connection() as conn:
                 cursor = conn.cursor()
                 cursor.execute("DELETE FROM components WHERE id = ?", (component_id,))
                 conn.commit()
@@ -374,12 +471,12 @@ class DatabaseManager:
             return False
     
     @staticmethod
-    def delete_machine(machine_name: str) -> bool:
+    def delete_machine(machine_id: int) -> bool:
         """Delete a machine and all its components (CASCADE will handle components)."""
         try:
-            with sqlite3.connect(get_db_path()) as conn:
+            with get_db_connection() as conn:
                 cursor = conn.cursor()
-                cursor.execute("DELETE FROM machines WHERE name = ?", (machine_name,))
+                cursor.execute("DELETE FROM machines WHERE id = ?", (machine_id,))
                 conn.commit()
                 return True
         except Exception as e:
@@ -390,7 +487,7 @@ class DatabaseManager:
     def was_email_sent_today(sent_date: str) -> bool:
         """Check if today's reminder has already been claimed or sent."""
         try:
-            with sqlite3.connect(get_db_path()) as conn:
+            with get_db_connection() as conn:
                 cursor = conn.cursor()
                 cursor.execute("""
                     SELECT 1 FROM email_log WHERE sent_date = ? LIMIT 1
@@ -404,7 +501,7 @@ class DatabaseManager:
     def claim_daily_email(sent_date: str) -> bool:
         """Claim today's reminder slot before sending to prevent duplicates."""
         try:
-            with sqlite3.connect(get_db_path()) as conn:
+            with get_db_connection() as conn:
                 cursor = conn.cursor()
                 cursor.execute("""
                     INSERT INTO email_log (
@@ -424,7 +521,7 @@ class DatabaseManager:
     def mark_email_sent(sent_date: str, components_count: int, recipients: str) -> bool:
         """Update the daily reminder row after a successful send."""
         try:
-            with sqlite3.connect(get_db_path()) as conn:
+            with get_db_connection() as conn:
                 cursor = conn.cursor()
                 cursor.execute("""
                     UPDATE email_log
@@ -441,7 +538,7 @@ class DatabaseManager:
     def mark_email_failed(sent_date: str, error_message: str) -> bool:
         """Record a failed send attempt for today's reminder."""
         try:
-            with sqlite3.connect(get_db_path()) as conn:
+            with get_db_connection() as conn:
                 cursor = conn.cursor()
                 cursor.execute("""
                     UPDATE email_log
@@ -455,28 +552,28 @@ class DatabaseManager:
             return False
     
     @staticmethod
-    def update_machine_details(old_name: str, new_name: str, serial_number: str = None, location: str = None) -> bool:
+    def update_machine_details(machine_id: int, old_name: str, new_name: str, serial_number: str = None, location: str = None) -> bool:
         """Update a machine's details including name, serial number, and location."""
         try:
-            with sqlite3.connect(get_db_path()) as conn:
+            with get_db_connection() as conn:
                 cursor = conn.cursor()
                 
                 # Update machine name if changed
                 if old_name != new_name:
                     # Update machine name
                     cursor.execute("""
-                        UPDATE machines SET name = ? WHERE name = ?
-                    """, (new_name, old_name))
+                        UPDATE machines SET name = ? WHERE id = ?
+                    """, (new_name, machine_id))
                     
                     # Update component parent references
                     cursor.execute("""
-                        UPDATE components SET parent_machine_name = ? WHERE parent_machine_name = ?
-                    """, (new_name, old_name))
+                        UPDATE components SET parent_machine_name = ? WHERE machine_id = ?
+                    """, (new_name, machine_id))
                 
                 # Update serial number and location
                 cursor.execute("""
-                    UPDATE machines SET serial_number = ?, location = ? WHERE name = ?
-                """, (serial_number, location, new_name))
+                    UPDATE machines SET serial_number = ?, location = ? WHERE id = ?
+                """, (serial_number, location, machine_id))
                 
                 conn.commit()
                 return True
@@ -484,21 +581,22 @@ class DatabaseManager:
             print(f"Error updating machine details: {e}")
             return False
     
-    def update_machine_name(old_name: str, new_name: str) -> bool:
+    @staticmethod
+    def update_machine_name(machine_id: int, new_name: str) -> bool:
         """Update a machine's name."""
         try:
-            with sqlite3.connect(get_db_path()) as conn:
+            with get_db_connection() as conn:
                 cursor = conn.cursor()
                 
                 # Update machine name
                 cursor.execute("""
-                    UPDATE machines SET name = ? WHERE name = ?
-                """, (new_name, old_name))
+                    UPDATE machines SET name = ? WHERE id = ?
+                """, (new_name, machine_id))
                 
                 # Update component parent references
                 cursor.execute("""
-                    UPDATE components SET parent_machine_name = ? WHERE parent_machine_name = ?
-                """, (new_name, old_name))
+                    UPDATE components SET parent_machine_name = ? WHERE machine_id = ?
+                """, (new_name, machine_id))
                 
                 conn.commit()
                 return True
@@ -507,14 +605,14 @@ class DatabaseManager:
             return False
     
     @staticmethod
-    def delete_components_by_machine(machine_name: str) -> bool:
+    def delete_components_by_machine_id(machine_id: int) -> bool:
         """Delete all components for a machine."""
         try:
-            with sqlite3.connect(get_db_path()) as conn:
+            with get_db_connection() as conn:
                 cursor = conn.cursor()
                 cursor.execute("""
-                    DELETE FROM components WHERE parent_machine_name = ?
-                """, (machine_name,))
+                    DELETE FROM components WHERE machine_id = ?
+                """, (machine_id,))
                 conn.commit()
                 return True
         except Exception as e:
@@ -525,14 +623,14 @@ class DatabaseManager:
     def get_components_due_soon() -> List[Dict]:
         """Get components that are due soon or overdue."""
         try:
-            with sqlite3.connect(get_db_path()) as conn:
+            with get_db_connection() as conn:
                 conn.row_factory = sqlite3.Row
                 cursor = conn.cursor()
                 
                 cursor.execute("""
-                    SELECT c.*, m.name as machine_name
+                    SELECT c.*, COALESCE(m.name, c.parent_machine_name) as machine_name
                     FROM components c
-                    JOIN machines m ON c.parent_machine_name = m.name
+                    LEFT JOIN machines m ON c.machine_id = m.id
                     WHERE c.next_due_date IS NOT NULL
                     ORDER BY c.next_due_date ASC
                 """)
@@ -829,12 +927,10 @@ class EmailNotificationThread(threading.Thread):
         
         if success:
             DatabaseManager.mark_email_sent(today, len(due_components), ", ".join(config.get('to_addrs', [])))
-            print(f"Email notification sent for {len(due_components)} components")
             if self._callback:
                 self._callback(f"Email sent: {len(due_components)} components alerted")
         else:
             DatabaseManager.mark_email_failed(today, error)
-            print(f"Failed to send email: {error}")
             if self._callback:
                 self._callback(f"Email failed: {error}")
 
@@ -1057,16 +1153,11 @@ class ComponentRow(QWidget):
         # Progress bar
         self.progress_bar = StyledProgressBar()
         days_remaining = self.component_data.get('days_remaining', 0)
-        total_days = self.component_data.get('pm_interval_days', 30)
+        total_days = self._get_progress_total_days(days_remaining)
         alert_threshold = self.component_data.get('alert_threshold_days', 5)
         
-        # Calculate percentage
-        if total_days > 0:
-            percentage = max(0, min(100, (days_remaining / total_days) * 100))
-        else:
-            percentage = 0
-        
-        self.progress_bar.setValue(int(percentage))
+        self.progress_bar.setRange(0, total_days)
+        self.progress_bar.setValue(min(days_remaining, total_days))
         self.progress_bar.set_health_color(days_remaining, alert_threshold)
         layout.addWidget(self.progress_bar, 1)
         
@@ -1158,12 +1249,38 @@ class ComponentRow(QWidget):
             }}
         """)
 
+    def _get_progress_total_days(self, days_remaining: int) -> int:
+        """Return the active phase length for the progress bar."""
+        custom_start_date = self.component_data.get('custom_start_date')
+        custom_start_applied_date = self.component_data.get('custom_start_applied_date')
+        last_performed_date = self.component_data.get('last_performed_date')
+        next_due_date = self.component_data.get('next_due_date')
+
+        # Before the first PM, the custom date is the active due date.
+        if (
+            custom_start_date
+            and next_due_date == custom_start_date
+        ):
+            phase_start = custom_start_applied_date
+            if not phase_start:
+                phase_start = self.component_data.get('created_at')
+
+            try:
+                if phase_start:
+                    phase_start_date = date.fromisoformat(str(phase_start).split(" ")[0])
+                    phase_end_date = date.fromisoformat(custom_start_date)
+                    return max((phase_end_date - phase_start_date).days, 1)
+            except ValueError:
+                pass
+
+        return max(self.component_data.get('pm_interval_days', 30), 1)
+
 class EquipmentCard(StyledCard):
     """Card widget for displaying equipment and its components."""
     
     reset_component = Signal(int)  # Signal with component ID
     edit_requested = Signal(dict)  # Signal with machine data for editing
-    delete_requested = Signal(str)  # Signal with machine name
+    delete_requested = Signal(dict)  # Signal with machine data
     refresh_needed = Signal()  # Signal to refresh the card
     
     def __init__(self, machine_data: Dict, parent=None):
@@ -1215,7 +1332,7 @@ class EquipmentCard(StyledCard):
             }}
         """)
         delete_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        delete_btn.clicked.connect(lambda: self.delete_requested.emit(self.machine_data['name']))
+        delete_btn.clicked.connect(lambda: self.delete_requested.emit(self.machine_data))
         delete_btn.setToolTip(f"Delete {self.machine_data['name']}")
         header_layout.addWidget(delete_btn)
         
@@ -1409,8 +1526,8 @@ class ComponentInputWidget(QWidget):
         name_label.setStyleSheet(f"QLabel {{ color: {Theme.TEXT_MUTED}; font-size: 12px; border: none; background-color: transparent; }}")
         layout.addWidget(name_label, 1, 0)
         
-        self.name_input = StyledLineEdit("e.g., Motor")
-        self.name_input.setMaxLength(14)
+        self.name_input = StyledLineEdit("e.g., Calibration")
+        self.name_input.setMaxLength(20)
         layout.addWidget(self.name_input, 1, 1, 1, 2)
         
         # Interval days
@@ -1560,8 +1677,15 @@ class ComponentInputWidget(QWidget):
         # Handle custom start date
         if self.custom_start_checkbox.isChecked():
             custom_date = self.custom_start_date.date().toPython()
-            data['custom_start_date'] = custom_date.isoformat()
-            data['last_performed_date'] = custom_date.isoformat()
+            custom_date_str = custom_date.isoformat()
+            data['custom_start_date'] = custom_date_str
+
+            existing_custom_start_date = getattr(self, '_existing_custom_start_date', None)
+            existing_custom_applied = getattr(self, '_existing_custom_start_applied_date', None)
+            if existing_custom_start_date == custom_date_str and existing_custom_applied:
+                data['custom_start_applied_date'] = existing_custom_applied
+            else:
+                data['custom_start_applied_date'] = date.today().isoformat()
         else:
             data['last_performed_date'] = date.today().isoformat()
         
@@ -1659,7 +1783,7 @@ class AddEquipmentDialog(QDialog):
         name_label.setStyleSheet(f"QLabel {{ color: {Theme.TEXT_PRIMARY}; font-weight: 600; font-size: 14px; border: none; }}")
         layout.addWidget(name_label)
         
-        self.equipment_name_input = StyledLineEdit("e.g., Assembly Line 1 (max 44 chars)")
+        self.equipment_name_input = StyledLineEdit("e.g., Torque Wrench (max 44 chars)")
         self.equipment_name_input.setMaxLength(44)  # Limit to 44 characters
         layout.addWidget(self.equipment_name_input)
         
@@ -1676,7 +1800,7 @@ class AddEquipmentDialog(QDialog):
         location_label.setStyleSheet(f"QLabel {{ color: {Theme.TEXT_PRIMARY}; font-weight: 600; font-size: 14px; border: none; }}")
         layout.addWidget(location_label)
         
-        self.location_input = StyledLineEdit("e.g., Production Floor A")
+        self.location_input = StyledLineEdit("e.g., Cell 1")
         layout.addWidget(self.location_input)
         
         # Components section
@@ -1852,6 +1976,15 @@ class AddEquipmentDialog(QDialog):
             widget.name_input.setText(component['component_name'])
             widget.interval_input.setValue(component['pm_interval_days'])
             widget.alert_input.setValue(component['alert_threshold_days'])
+            custom_start = component.get('custom_start_date')
+            if custom_start:
+                widget.custom_start_checkbox.setChecked(True)
+                try:
+                    widget.custom_start_date.setDate(date.fromisoformat(custom_start))
+                except ValueError:
+                    pass
+                widget._existing_custom_start_date = custom_start
+                widget._existing_custom_start_applied_date = component.get('custom_start_applied_date')
             widget.delete_requested.connect(lambda: self._remove_component(widget))
             self.component_widgets.append(widget)
             self.components_layout.addWidget(widget)
@@ -1876,37 +2009,33 @@ class AddEquipmentDialog(QDialog):
         location = self.location_input.text().strip() or None
         components_data = []
         
-        print(f"Saving equipment: {equipment_name}")
-        print(f"Component widgets count: {len(self.component_widgets)}")
-        
         for widget in self.component_widgets:
             data = widget.get_data()
             if data:
                 components_data.append(data)
-                print(f"Component data: {data}")
-        
-        print(f"Total components to save: {len(components_data)}")
         
         if equipment_name and components_data:
             if self.is_edit_mode:
                 # Update existing machine
                 old_name = self.machine_data['name']
-                if not DatabaseManager.update_machine_details(old_name, equipment_name, serial_number, location):
+                machine_id = self.machine_data['id']
+                if not DatabaseManager.update_machine_details(machine_id, old_name, equipment_name, serial_number, location):
                     self._show_error_message("Failed to update equipment. Please try again.")
                     return
                 
                 # Delete old components and add new ones
-                DatabaseManager.delete_components_by_machine(equipment_name)
+                DatabaseManager.delete_components_by_machine_id(machine_id)
                 for comp_data in components_data:
-                    DatabaseManager.add_component(equipment_name, comp_data)
+                    DatabaseManager.add_component(machine_id, equipment_name, comp_data)
                 
                 self.accept()
             else:
                 # Add new machine to database
-                if DatabaseManager.add_machine(equipment_name, serial_number, location):
+                machine_id = DatabaseManager.add_machine(equipment_name, serial_number, location)
+                if machine_id is not None:
                     # Add components
                     for comp_data in components_data:
-                        if not DatabaseManager.add_component(equipment_name, comp_data):
+                        if not DatabaseManager.add_component(machine_id, equipment_name, comp_data):
                             self._show_error_message("Failed to add component. Please try again.")
                             return
                     
@@ -2248,7 +2377,7 @@ class MainWindow(QMainWindow):
     
     def _setup_ui(self):
         """Setup the main UI."""
-        self.setWindowTitle("Production PM Tracker")
+        self.setWindowTitle("Equipment PM Tracker")
         # Remove minimum size since window is always maximized
         self.setStyleSheet(f"""
             QMainWindow {{
@@ -2642,9 +2771,33 @@ class MainWindow(QMainWindow):
         if not QSystemTrayIcon.isSystemTrayAvailable():
             return
         
-        # Create a simple icon (in production, use a proper icon file)
+        # Create a small tray-and-arrow icon directly in code.
         pixmap = QPixmap(64, 64)
-        pixmap.fill(QColor(Theme.PRIMARY))
+        pixmap.fill(Qt.GlobalColor.transparent)
+        painter = QPainter(pixmap)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+
+        accent = QColor(Theme.PRIMARY)
+        base = QColor(Theme.BG_PRIMARY)
+        white = QColor("#ffffff")
+
+        # Tray base
+        painter.setPen(QPen(accent, 3, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap, Qt.PenJoinStyle.RoundJoin))
+        painter.setBrush(QBrush(base))
+        painter.drawRoundedRect(12, 28, 40, 20, 6, 6)
+
+        # Arrow
+        painter.setPen(QPen(white, 4, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap, Qt.PenJoinStyle.RoundJoin))
+        painter.drawLine(32, 16, 32, 34)
+        arrow_head = QPolygon([
+            QPoint(24, 26),
+            QPoint(32, 36),
+            QPoint(40, 26),
+        ])
+        painter.setBrush(QBrush(white))
+        painter.drawPolygon(arrow_head)
+        painter.end()
+
         icon = QIcon(pixmap)
         
         self.tray_icon = QSystemTrayIcon(icon)
@@ -2678,7 +2831,7 @@ class MainWindow(QMainWindow):
     
     def _email_notification_callback(self, message: str):
         """Handle email notification callback."""
-        print(f"Email notification: {message}")
+        pass
     
     def _add_equipment(self):
         """Open the add equipment dialog."""
@@ -2692,8 +2845,10 @@ class MainWindow(QMainWindow):
         if dialog.exec() == QDialog.DialogCode.Accepted:
             self._refresh_data()
     
-    def _delete_equipment(self, machine_name: str):
+    def _delete_equipment(self, machine_data: Dict):
         """Handle equipment deletion with confirmation."""
+        machine_id = machine_data['id']
+        machine_name = machine_data['name']
         msg_box = QMessageBox(self)
         msg_box.setWindowTitle("Delete Equipment")
         msg_box.setText(f"Are you sure you want to delete '{machine_name}' and all its components?")
@@ -2729,7 +2884,7 @@ class MainWindow(QMainWindow):
         reply = msg_box.exec()
         
         if reply == QMessageBox.StandardButton.Yes:
-            if DatabaseManager.delete_machine(machine_name):
+            if DatabaseManager.delete_machine(machine_id):
                 self._refresh_data()
     
     def _open_email_config(self):
