@@ -169,16 +169,46 @@ def init_database():
         except sqlite3.OperationalError:
             pass  # Column already exists
         
-        # Create email_log table to track sent emails
+        # Create email_log table to track one reminder per day
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS email_log (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 sent_date TEXT NOT NULL,
                 sent_at TEXT NOT NULL,
-                components_count INTEGER NOT NULL,
-                recipients TEXT NOT NULL
+                components_count INTEGER NOT NULL DEFAULT 0,
+                recipients TEXT NOT NULL DEFAULT '',
+                status TEXT NOT NULL DEFAULT 'sending',
+                error_message TEXT
             )
         """)
+
+        # Keep one log row per date so another app launch cannot send again
+        try:
+            cursor.execute("""
+                DELETE FROM email_log
+                WHERE id NOT IN (
+                    SELECT MAX(id)
+                    FROM email_log
+                    GROUP BY sent_date
+                )
+            """)
+            cursor.execute("""
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_email_log_sent_date
+                ON email_log(sent_date)
+            """)
+        except sqlite3.OperationalError:
+            pass
+
+        # Add new columns to older databases if they are missing
+        try:
+            cursor.execute("ALTER TABLE email_log ADD COLUMN status TEXT NOT NULL DEFAULT 'sending'")
+        except sqlite3.OperationalError:
+            pass
+
+        try:
+            cursor.execute("ALTER TABLE email_log ADD COLUMN error_message TEXT")
+        except sqlite3.OperationalError:
+            pass
         
         conn.commit()
 
@@ -357,65 +387,71 @@ class DatabaseManager:
             return False
     
     @staticmethod
-    def log_email_sent(sent_date: str, components_count: int, recipients: str) -> bool:
-        """Log that an email was sent to prevent duplicates."""
-        try:
-            with sqlite3.connect(get_db_path()) as conn:
-                cursor = conn.cursor()
-                cursor.execute("""
-                    INSERT INTO email_log (sent_date, sent_at, components_count, recipients)
-                    VALUES (?, ?, ?, ?)
-                """, (sent_date, datetime.now().isoformat(), components_count, recipients))
-                conn.commit()
-                return True
-        except Exception as e:
-            print(f"Error logging email: {e}")
-            return False
-    
-    @staticmethod
     def was_email_sent_today(sent_date: str) -> bool:
-        """Check if an email was already sent today."""
+        """Check if today's reminder has already been claimed or sent."""
         try:
             with sqlite3.connect(get_db_path()) as conn:
                 cursor = conn.cursor()
                 cursor.execute("""
-                    SELECT COUNT(*) FROM email_log WHERE sent_date = ?
+                    SELECT 1 FROM email_log WHERE sent_date = ? LIMIT 1
                 """, (sent_date,))
-                return cursor.fetchone()[0] > 0
+                return cursor.fetchone() is not None
         except Exception as e:
             print(f"Error checking email log: {e}")
             return False
-    
 
-    
     @staticmethod
-    def log_email_sent(sent_date: str, components_count: int, recipients: str) -> bool:
-        """Log that an email was sent to prevent duplicates."""
+    def claim_daily_email(sent_date: str) -> bool:
+        """Claim today's reminder slot before sending to prevent duplicates."""
         try:
             with sqlite3.connect(get_db_path()) as conn:
                 cursor = conn.cursor()
                 cursor.execute("""
-                    INSERT INTO email_log (sent_date, sent_at, components_count, recipients)
-                    VALUES (?, ?, ?, ?)
-                """, (sent_date, datetime.now().isoformat(), components_count, recipients))
+                    INSERT INTO email_log (
+                        sent_date, sent_at, components_count, recipients, status, error_message
+                    )
+                    VALUES (?, ?, 0, '', 'sending', NULL)
+                """, (sent_date, datetime.now().isoformat()))
                 conn.commit()
                 return True
-        except Exception as e:
-            print(f"Error logging email: {e}")
+        except sqlite3.IntegrityError:
             return False
-    
+        except Exception as e:
+            print(f"Error claiming email slot: {e}")
+            return False
+
     @staticmethod
-    def was_email_sent_today(sent_date: str) -> bool:
-        """Check if an email was already sent today."""
+    def mark_email_sent(sent_date: str, components_count: int, recipients: str) -> bool:
+        """Update the daily reminder row after a successful send."""
         try:
             with sqlite3.connect(get_db_path()) as conn:
                 cursor = conn.cursor()
                 cursor.execute("""
-                    SELECT COUNT(*) FROM email_log WHERE sent_date = ?
-                """, (sent_date,))
-                return cursor.fetchone()[0] > 0
+                    UPDATE email_log
+                    SET sent_at = ?, components_count = ?, recipients = ?, status = 'sent', error_message = NULL
+                    WHERE sent_date = ?
+                """, (datetime.now().isoformat(), components_count, recipients, sent_date))
+                conn.commit()
+                return cursor.rowcount > 0
         except Exception as e:
-            print(f"Error checking email log: {e}")
+            print(f"Error updating email log: {e}")
+            return False
+
+    @staticmethod
+    def mark_email_failed(sent_date: str, error_message: str) -> bool:
+        """Record a failed send attempt for today's reminder."""
+        try:
+            with sqlite3.connect(get_db_path()) as conn:
+                cursor = conn.cursor()
+                cursor.execute("""
+                    UPDATE email_log
+                    SET status = 'failed', error_message = ?
+                    WHERE sent_date = ?
+                """, (error_message, sent_date))
+                conn.commit()
+                return cursor.rowcount > 0
+        except Exception as e:
+            print(f"Error updating failed email log: {e}")
             return False
     
     @staticmethod
@@ -779,21 +815,25 @@ class EmailNotificationThread(threading.Thread):
         today = date.today().isoformat()
         if DatabaseManager.was_email_sent_today(today):
             return  # Already sent today
-        
+
         due_components = DatabaseManager.get_components_due_soon()
         
         if not due_components:
             return
+
+        if not DatabaseManager.claim_daily_email(today):
+            return  # Another app instance already claimed today's reminder
         
         subject, html = EmailConfig.build_alert_email(due_components)
         success, error = EmailConfig.send_email(config, subject, html)
         
         if success:
-            DatabaseManager.log_email_sent(today, len(due_components), ", ".join(config.get('to_addrs', [])))
+            DatabaseManager.mark_email_sent(today, len(due_components), ", ".join(config.get('to_addrs', [])))
             print(f"Email notification sent for {len(due_components)} components")
             if self._callback:
                 self._callback(f"Email sent: {len(due_components)} components alerted")
         else:
+            DatabaseManager.mark_email_failed(today, error)
             print(f"Failed to send email: {error}")
             if self._callback:
                 self._callback(f"Email failed: {error}")
@@ -2414,8 +2454,8 @@ class MainWindow(QMainWindow):
         """)
         title_layout.addWidget(title)
         
-        subtitle = QLabel("Keep your equipment running smoothly")
-        subtitle.setStyleSheet(f"QLabel {{ color: #78716c; font-size: 14px; border: none; }}")
+        subtitle = QLabel("Made by Sankar | v1.0")
+        subtitle.setStyleSheet(f"QLabel {{ color: #78716c; font-size: 12px; border: none; }}")
         title_layout.addWidget(subtitle)
         
         title_section.addLayout(title_layout)
