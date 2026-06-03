@@ -30,9 +30,11 @@ from PySide6.QtWidgets import (
     QPushButton, QLabel, QLineEdit, QDialog, QDialogButtonBox,
     QScrollArea, QFrame, QGridLayout, QMessageBox, QSystemTrayIcon,
     QMenu, QProgressBar, QSpinBox, QDoubleSpinBox, QCheckBox,
-    QComboBox, QGroupBox, QSplitter, QSpacerItem, QSizePolicy, QAbstractSpinBox
+    QComboBox, QGroupBox, QSplitter, QSpacerItem, QSizePolicy, QAbstractSpinBox,
+    QTableWidget, QTableWidgetItem, QHeaderView, QTextEdit
 )
 from PySide6.QtCore import Qt, QTimer, QSize, Signal, QObject, QEvent, QPoint
+from PySide6.QtWidgets import QDateEdit
 from PySide6.QtGui import QIcon, QPixmap, QColor, QFont, QPalette, QAction, QPainter, QPen, QBrush, QPolygon
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -71,6 +73,12 @@ class Theme:
     CORNER_RADIUS = 16
     BUTTON_HEIGHT = 44
     INPUT_HEIGHT = 44
+
+class NoWheelDateEdit(QDateEdit):
+    """Date edit that blocks mouse wheel changes."""
+
+    def wheelEvent(self, event):
+        event.ignore()
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  DATABASE SETUP
@@ -251,6 +259,40 @@ def init_database():
             """)
         except sqlite3.OperationalError:
             pass
+
+        # Create maintenance log table for component service history
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS maintenance_log (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                machine_id INTEGER NOT NULL,
+                component_id INTEGER NOT NULL,
+                machine_name TEXT NOT NULL,
+                component_name TEXT NOT NULL,
+                maintenance_date TEXT NOT NULL,
+                recorded_at TEXT NOT NULL,
+                pm_interval_days INTEGER NOT NULL,
+                next_due_date TEXT NOT NULL,
+                notes TEXT,
+                FOREIGN KEY (machine_id) REFERENCES machines(id) ON DELETE CASCADE,
+                FOREIGN KEY (component_id) REFERENCES components(id) ON DELETE CASCADE
+            )
+        """)
+
+        try:
+            cursor.execute("""
+                CREATE INDEX IF NOT EXISTS idx_maintenance_log_component_date
+                ON maintenance_log(component_id, maintenance_date DESC)
+            """)
+        except sqlite3.OperationalError:
+            pass
+
+        try:
+            cursor.execute("""
+                CREATE INDEX IF NOT EXISTS idx_maintenance_log_machine_date
+                ON maintenance_log(machine_id, maintenance_date DESC)
+            """)
+        except sqlite3.OperationalError:
+            pass
         
         # Create email_log table to track one reminder per day
         cursor.execute("""
@@ -373,6 +415,149 @@ class DatabaseManager:
         except Exception as e:
             print(f"Error adding component: {e}")
             return False
+
+    @staticmethod
+    def _apply_component_schedule_state(cursor, component_id: int) -> bool:
+        """Rebuild the current component schedule from its maintenance history."""
+        try:
+            cursor.execute("""
+                SELECT pm_interval_days
+                FROM components
+                WHERE id = ?
+            """, (component_id,))
+            component_row = cursor.fetchone()
+            if not component_row:
+                return False
+
+            interval_days = component_row["pm_interval_days"]
+            cursor.execute("""
+                SELECT maintenance_date
+                FROM maintenance_log
+                WHERE component_id = ?
+                ORDER BY maintenance_date DESC, recorded_at DESC, id DESC
+                LIMIT 1
+            """, (component_id,))
+            latest_log = cursor.fetchone()
+
+            if latest_log:
+                performed_date = latest_log["maintenance_date"]
+                next_due_date = (date.fromisoformat(performed_date) + timedelta(days=interval_days)).isoformat()
+            else:
+                performed_date = None
+                next_due_date = None
+
+            cursor.execute("""
+                UPDATE components
+                SET last_performed_date = ?,
+                    next_due_date = ?,
+                    custom_start_date = NULL,
+                    custom_start_applied_date = NULL
+                WHERE id = ?
+            """, (performed_date, next_due_date, component_id))
+            return True
+        except Exception as e:
+            print(f"Error applying component schedule state: {e}")
+            return False
+
+    @staticmethod
+    def update_component(component_id: int, machine_id: int, machine_name: str, component_data: Dict) -> bool:
+        """Update an existing component in place."""
+        try:
+            with get_db_connection() as conn:
+                cursor = conn.cursor()
+
+                last_performed = component_data.get('last_performed_date')
+                next_due = None
+                custom_start = component_data.get('custom_start_date')
+                custom_start_applied = component_data.get('custom_start_applied_date')
+
+                if custom_start:
+                    try:
+                        next_due = date.fromisoformat(custom_start).isoformat()
+                    except ValueError:
+                        next_due = custom_start
+                    last_performed = None
+                    if not custom_start_applied:
+                        custom_start_applied = date.today().isoformat()
+                elif last_performed:
+                    try:
+                        last_date = date.fromisoformat(last_performed)
+                        interval = component_data.get('pm_interval_days', 30)
+                        next_date = last_date + timedelta(days=interval)
+                        next_due = next_date.isoformat()
+                    except ValueError:
+                        pass
+
+                cursor.execute("""
+                    UPDATE components
+                    SET machine_id = ?,
+                        parent_machine_name = ?,
+                        component_name = ?,
+                        pm_interval_days = ?,
+                        alert_threshold_days = ?,
+                        last_performed_date = ?,
+                        next_due_date = ?,
+                        custom_start_date = ?,
+                        custom_start_applied_date = ?
+                    WHERE id = ?
+                """, (
+                    machine_id,
+                    machine_name,
+                    component_data['component_name'],
+                    component_data['pm_interval_days'],
+                    component_data['alert_threshold_days'],
+                    last_performed,
+                    next_due,
+                    custom_start,
+                    custom_start_applied,
+                    component_id
+                ))
+                conn.commit()
+                return True
+        except Exception as e:
+            print(f"Error updating component: {e}")
+            return False
+
+    @staticmethod
+    def get_components_for_machine(machine_id: int) -> List[Dict]:
+        """Get all components for a machine, ordered by id."""
+        try:
+            with get_db_connection() as conn:
+                conn.row_factory = sqlite3.Row
+                cursor = conn.cursor()
+                cursor.execute("""
+                    SELECT *
+                    FROM components
+                    WHERE machine_id = ?
+                    ORDER BY component_name, id
+                """, (machine_id,))
+                return [dict(row) for row in cursor.fetchall()]
+        except Exception as e:
+            print(f"Error getting machine components: {e}")
+            return []
+
+    @staticmethod
+    def get_component_details(component_id: int) -> Optional[Dict]:
+        """Get a single component with its owning machine details."""
+        try:
+            with get_db_connection() as conn:
+                conn.row_factory = sqlite3.Row
+                cursor = conn.cursor()
+                cursor.execute("""
+                    SELECT
+                        c.*,
+                        COALESCE(m.name, c.parent_machine_name) AS machine_name,
+                        m.serial_number AS machine_serial_number,
+                        m.location AS machine_location
+                    FROM components c
+                    LEFT JOIN machines m ON c.machine_id = m.id
+                    WHERE c.id = ?
+                """, (component_id,))
+                row = cursor.fetchone()
+                return dict(row) if row else None
+        except Exception as e:
+            print(f"Error getting component details: {e}")
+            return None
     
     @staticmethod
     def get_all_machines() -> List[Dict]:
@@ -427,34 +612,163 @@ class DatabaseManager:
     @staticmethod
     def reset_component(component_id: int) -> bool:
         """Reset a component's maintenance to today."""
+        return DatabaseManager.record_component_maintenance(component_id)
+
+    @staticmethod
+    def record_component_maintenance(
+        component_id: int,
+        maintenance_date: Optional[str] = None,
+        notes: Optional[str] = None
+    ) -> bool:
+        """Record maintenance for a component, log it, and reset the interval."""
         try:
             with get_db_connection() as conn:
+                conn.row_factory = sqlite3.Row
                 cursor = conn.cursor()
                 
-                # Get component details first
+                # Get component and machine details first
                 cursor.execute("""
-                    SELECT pm_interval_days FROM components WHERE id = ?
+                    SELECT
+                        c.*,
+                        COALESCE(m.name, c.parent_machine_name) AS machine_name,
+                        m.serial_number AS machine_serial_number
+                    FROM components c
+                    LEFT JOIN machines m ON c.machine_id = m.id
+                    WHERE c.id = ?
                 """, (component_id,))
                 result = cursor.fetchone()
                 
                 if not result:
                     return False
                 
-                interval_days = result[0]
-                today = date.today().isoformat()
-                next_due = (date.today() + timedelta(days=interval_days)).isoformat()
+                component = dict(result)
+                interval_days = component['pm_interval_days']
+                performed_date = maintenance_date or date.today().isoformat()
+
+                try:
+                    performed_day = date.fromisoformat(performed_date)
+                except ValueError:
+                    return False
+
+                next_due = (performed_day + timedelta(days=interval_days)).isoformat()
                 
-                # Update the component
+                # Update the component and append a maintenance history row
                 cursor.execute("""
                     UPDATE components 
                     SET last_performed_date = ?, next_due_date = ?, custom_start_date = NULL, custom_start_applied_date = NULL
                     WHERE id = ?
-                """, (today, next_due, component_id))
-                
+                """, (performed_date, next_due, component_id))
+
+                cursor.execute("""
+                    INSERT INTO maintenance_log (
+                        machine_id, component_id, machine_name, component_name,
+                        maintenance_date, recorded_at, pm_interval_days, next_due_date, notes
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """, (
+                    component['machine_id'],
+                    component_id,
+                    component['machine_name'],
+                    component['component_name'],
+                    performed_date,
+                    datetime.now().isoformat(),
+                    interval_days,
+                    next_due,
+                    notes
+                ))
+                if not DatabaseManager._apply_component_schedule_state(cursor, component_id):
+                    conn.rollback()
+                    return False
                 conn.commit()
                 return True
         except Exception as e:
-            print(f"Error resetting component: {e}")
+            print(f"Error recording component maintenance: {e}")
+            return False
+
+    @staticmethod
+    def update_maintenance_log(log_id: int, maintenance_date: str, notes: Optional[str] = None) -> bool:
+        """Edit a maintenance log entry and recalculate the component schedule."""
+        try:
+            with get_db_connection() as conn:
+                conn.row_factory = sqlite3.Row
+                cursor = conn.cursor()
+                cursor.execute("""
+                    SELECT component_id
+                    FROM maintenance_log
+                    WHERE id = ?
+                """, (log_id,))
+                log_row = cursor.fetchone()
+                if not log_row:
+                    return False
+
+                component_id = log_row["component_id"]
+                cursor.execute("""
+                    SELECT pm_interval_days
+                    FROM components
+                    WHERE id = ?
+                """, (component_id,))
+                component_row = cursor.fetchone()
+                if not component_row:
+                    return False
+
+                try:
+                    performed_day = date.fromisoformat(maintenance_date)
+                except ValueError:
+                    return False
+
+                interval_days = component_row["pm_interval_days"]
+                next_due = (performed_day + timedelta(days=interval_days)).isoformat()
+                cursor.execute("""
+                    UPDATE maintenance_log
+                    SET maintenance_date = ?,
+                        recorded_at = ?,
+                        pm_interval_days = ?,
+                        next_due_date = ?,
+                        notes = ?
+                    WHERE id = ?
+                """, (
+                    maintenance_date,
+                    datetime.now().isoformat(),
+                    interval_days,
+                    next_due,
+                    notes,
+                    log_id
+                ))
+                if not DatabaseManager._apply_component_schedule_state(cursor, component_id):
+                    conn.rollback()
+                    return False
+                conn.commit()
+                return True
+        except Exception as e:
+            print(f"Error updating maintenance log: {e}")
+            return False
+
+    @staticmethod
+    def delete_maintenance_log(log_id: int) -> bool:
+        """Delete a maintenance log entry and recalculate the component schedule."""
+        try:
+            with get_db_connection() as conn:
+                conn.row_factory = sqlite3.Row
+                cursor = conn.cursor()
+                cursor.execute("""
+                    SELECT component_id
+                    FROM maintenance_log
+                    WHERE id = ?
+                """, (log_id,))
+                log_row = cursor.fetchone()
+                if not log_row:
+                    return False
+
+                component_id = log_row["component_id"]
+                cursor.execute("DELETE FROM maintenance_log WHERE id = ?", (log_id,))
+                if cursor.rowcount <= 0:
+                    return False
+                if not DatabaseManager._apply_component_schedule_state(cursor, component_id):
+                    conn.rollback()
+                    return False
+                conn.commit()
+                return True
+        except Exception as e:
+            print(f"Error deleting maintenance log: {e}")
             return False
     
     @staticmethod
@@ -628,7 +942,10 @@ class DatabaseManager:
                 cursor = conn.cursor()
                 
                 cursor.execute("""
-                    SELECT c.*, COALESCE(m.name, c.parent_machine_name) as machine_name
+                    SELECT
+                        c.*,
+                        COALESCE(m.name, c.parent_machine_name) as machine_name,
+                        m.serial_number as machine_serial_number
                     FROM components c
                     LEFT JOIN machines m ON c.machine_id = m.id
                     WHERE c.next_due_date IS NOT NULL
@@ -650,6 +967,36 @@ class DatabaseManager:
                 return due_components
         except Exception as e:
             print(f"Error getting due components: {e}")
+            return []
+
+    @staticmethod
+    def get_maintenance_history(machine_id: Optional[int] = None, component_id: Optional[int] = None) -> List[Dict]:
+        """Get maintenance log entries for a machine or component."""
+        try:
+            with get_db_connection() as conn:
+                conn.row_factory = sqlite3.Row
+                cursor = conn.cursor()
+
+                query = """
+                    SELECT *
+                    FROM maintenance_log
+                """
+                params = []
+                filters = []
+                if machine_id is not None:
+                    filters.append("machine_id = ?")
+                    params.append(machine_id)
+                if component_id is not None:
+                    filters.append("component_id = ?")
+                    params.append(component_id)
+                if filters:
+                    query += " WHERE " + " AND ".join(filters)
+                query += " ORDER BY maintenance_date DESC, recorded_at DESC, id DESC"
+
+                cursor.execute(query, params)
+                return [dict(row) for row in cursor.fetchall()]
+        except Exception as e:
+            print(f"Error getting maintenance history: {e}")
             return []
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -766,6 +1113,18 @@ class EmailConfig:
         # Build HTML sections for each machine
         sections_html = ""
         for machine_name, machine_components in machines.items():
+            machine_serial_number = next(
+                (
+                    item.get('machine_serial_number')
+                    for item in machine_components
+                    if item.get('machine_serial_number')
+                ),
+                None
+            )
+            machine_title = machine_name
+            if machine_serial_number:
+                machine_title = f"{machine_name} (SN: {machine_serial_number})"
+
             machine_components_sorted = sorted(machine_components, key=lambda x: x['days_remaining'])
             
             # Build rows for this machine
@@ -787,7 +1146,7 @@ class EmailConfig:
             overdue_count = sum(1 for x in machine_components if x['days_remaining'] <= 0)
             intro = (
                 f"The following {len(machine_components)} component(s) for "
-                f"<strong>{machine_name}</strong> are due within 30 days or are already overdue."
+                f"<strong>{machine_title}</strong> are due within 30 days or are already overdue."
             )
             if overdue_count:
                 intro += f" <strong style='color:#fca5a5;'>{overdue_count} component(s) are already overdue.</strong>"
@@ -798,7 +1157,7 @@ class EmailConfig:
               <table width="100%" cellpadding="0" cellspacing="0">
                 <tr>
                   <td style="background:#5fd1c8;border-radius:6px 6px 0 0;padding:14px 16px;">
-                    <div style="font-size:15px;font-weight:700;color:#fff;">{machine_name}</div>
+                    <div style="font-size:15px;font-weight:700;color:#fff;">{machine_title}</div>
                     <div style="font-size:12px;color:#a0c0e8;margin-top:3px;">
                       {len(machine_components)} component(s) require attention
                     </div>
@@ -1190,8 +1549,8 @@ class ComponentRow(QWidget):
         """)
         layout.addWidget(days_label)
         
-        # Reset button
-        reset_btn = QPushButton("⟳")
+        # Record maintenance button
+        reset_btn = QPushButton("✓")
         reset_btn.setFixedSize(32, 32)
         reset_btn.setStyleSheet(f"""
             QPushButton {{
@@ -1206,7 +1565,7 @@ class ComponentRow(QWidget):
         """)
         reset_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         reset_btn.clicked.connect(lambda: self.reset_clicked.emit(self.component_data['id']))
-        reset_btn.setToolTip(f"Reset maintenance for {self.component_data['component_name']}")
+        reset_btn.setToolTip(f"Record maintenance for {self.component_data['component_name']}")
         
         # Delete button
         delete_btn = QPushButton("✕")
@@ -1275,12 +1634,477 @@ class ComponentRow(QWidget):
 
         return max(self.component_data.get('pm_interval_days', 30), 1)
 
+class RecordMaintenanceDialog(QDialog):
+    """Dialog for recording a completed maintenance action."""
+
+    def __init__(
+        self,
+        machine_name: str,
+        component_name: str,
+        parent=None,
+        maintenance_date: Optional[str] = None,
+        notes: Optional[str] = None
+    ):
+        super().__init__(parent)
+        self.machine_name = machine_name
+        self.component_name = component_name
+        self._initial_maintenance_date = maintenance_date
+        self._initial_notes = notes
+        self._setup_ui()
+
+    def _setup_ui(self):
+        self.setWindowTitle("Edit Maintenance" if self._initial_maintenance_date or self._initial_notes else "Record Maintenance")
+        self.setMinimumWidth(460)
+        self.setStyleSheet(f"""
+            QDialog {{
+                background-color: {Theme.BG_PRIMARY};
+                color: {Theme.TEXT_PRIMARY};
+            }}
+        """)
+
+        layout = QVBoxLayout()
+        layout.setSpacing(14)
+
+        title = QLabel("Edit Maintenance" if self._initial_maintenance_date or self._initial_notes else "Record Maintenance")
+        title.setStyleSheet(f"""
+            QLabel {{
+                color: {Theme.TEXT_PRIMARY};
+                font-size: 18px;
+                font-weight: 700;
+                border: none;
+            }}
+        """)
+        layout.addWidget(title)
+
+        summary = QLabel(f"{self.machine_name}  •  {self.component_name}")
+        summary.setStyleSheet(f"""
+            QLabel {{
+                color: {Theme.TEXT_MUTED};
+                font-size: 13px;
+                border: none;
+            }}
+        """)
+        layout.addWidget(summary)
+
+        date_label = QLabel("Maintenance Date")
+        date_label.setStyleSheet(f"QLabel {{ color: {Theme.TEXT_PRIMARY}; font-weight: 600; border: none; }}")
+        layout.addWidget(date_label)
+
+        self.date_input = NoWheelDateEdit()
+        self.date_input.setCalendarPopup(True)
+        if self._initial_maintenance_date:
+            try:
+                self.date_input.setDate(date.fromisoformat(self._initial_maintenance_date))
+            except ValueError:
+                self.date_input.setDate(date.today())
+        else:
+            self.date_input.setDate(date.today())
+        self.date_input.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        self.date_input.setStyleSheet(f"""
+            QDateEdit {{
+                color: {Theme.TEXT_PRIMARY};
+                background-color: {Theme.BG_INPUT};
+                border: 1px solid {Theme.BORDER};
+                border-radius: 6px;
+                padding: 8px;
+            }}
+            QDateEdit:focus {{
+                border: 1px solid {Theme.BORDER_FOCUS};
+            }}
+            QCalendarWidget QWidget#qt_calendar_navigationbar {{
+                background-color: {Theme.BG_CARD};
+                padding: 4px 8px;
+                min-height: 32px;
+            }}
+            QCalendarWidget QToolButton {{
+                color: {Theme.TEXT_PRIMARY};
+                background-color: transparent;
+                min-width: 28px;
+                min-height: 28px;
+                padding: 4px;
+                margin: 2px;
+                border-radius: 4px;
+                font-size: 14px;
+            }}
+            QCalendarWidget QToolButton#qt_calendar_prevmonth,
+            QCalendarWidget QToolButton#qt_calendar_nextmonth {{
+                min-width: 28px;
+                max-width: 28px;
+                min-height: 28px;
+                max-height: 28px;
+                padding: 2px;
+                qproperty-iconSize: 16px 16px;
+            }}
+            QCalendarWidget QToolButton#qt_calendar_monthbutton,
+            QCalendarWidget QToolButton#qt_calendar_yearbutton {{
+                padding: 4px 16px 4px 8px;
+            }}
+            QCalendarWidget QToolButton#qt_calendar_monthbutton::menu-indicator {{
+                subcontrol-position: center right;
+                subcontrol-origin: padding;
+                right: 2px;
+                width: 10px;
+                height: 10px;
+            }}
+            QCalendarWidget QToolButton:hover {{
+                background-color: {Theme.BG_MUTED};
+            }}
+            QCalendarWidget QMenu {{
+                background-color: {Theme.BG_CARD};
+                color: {Theme.TEXT_PRIMARY};
+            }}
+            QCalendarWidget QSpinBox {{
+                color: {Theme.TEXT_PRIMARY};
+                background-color: {Theme.BG_INPUT};
+                selection-background-color: {Theme.PRIMARY};
+                selection-color: {Theme.TEXT_PRIMARY};
+            }}
+            QCalendarWidget QAbstractItemView:enabled {{
+                color: {Theme.TEXT_PRIMARY};
+                background-color: {Theme.BG_PRIMARY};
+                selection-background-color: {Theme.PRIMARY};
+                selection-color: {Theme.TEXT_PRIMARY};
+            }}
+            QCalendarWidget QAbstractItemView:disabled {{
+                color: {Theme.TEXT_DISABLED};
+            }}
+        """)
+        layout.addWidget(self.date_input)
+
+        notes_label = QLabel("Notes (optional)")
+        notes_label.setStyleSheet(f"QLabel {{ color: {Theme.TEXT_PRIMARY}; font-weight: 600; border: none; }}")
+        layout.addWidget(notes_label)
+
+        self.notes_input = QTextEdit()
+        self.notes_input.setPlaceholderText("Add any useful notes about what was completed...")
+        self.notes_input.setMinimumHeight(110)
+        self.notes_input.setStyleSheet(f"""
+            QTextEdit {{
+                color: {Theme.TEXT_PRIMARY};
+                background-color: {Theme.BG_INPUT};
+                border: 1px solid {Theme.BORDER};
+                border-radius: 8px;
+                padding: 8px;
+            }}
+            QTextEdit:focus {{
+                border: 1px solid {Theme.BORDER_FOCUS};
+            }}
+        """)
+        if self._initial_notes:
+            self.notes_input.setPlainText(self._initial_notes)
+        layout.addWidget(self.notes_input)
+
+        button_layout = QHBoxLayout()
+        button_layout.addStretch()
+
+        cancel_btn = StyledButton("Cancel", primary=False)
+        cancel_btn.clicked.connect(self.reject)
+        button_layout.addWidget(cancel_btn)
+
+        save_btn = StyledButton("Save", primary=True)
+        save_btn.clicked.connect(self.accept)
+        button_layout.addWidget(save_btn)
+
+        layout.addLayout(button_layout)
+        self.setLayout(layout)
+
+    def get_data(self) -> tuple[str, str]:
+        """Return the selected maintenance date and notes."""
+        maintenance_date = self.date_input.date().toPython().isoformat()
+        notes = self.notes_input.toPlainText().strip() or None
+        return maintenance_date, notes
+
+class MaintenanceHistoryDialog(QDialog):
+    """Dialog for reviewing maintenance history for an equipment item."""
+
+    def __init__(self, machine_data: Dict, parent=None):
+        super().__init__(parent)
+        self.machine_data = machine_data
+        self._all_logs = []
+        self._visible_logs = []
+        self._setup_ui()
+        self._load_logs()
+
+    def _setup_ui(self):
+        self.setWindowTitle("Maintenance History")
+        self.setMinimumSize(760, 480)
+        self.setStyleSheet(f"""
+            QDialog {{
+                background-color: {Theme.BG_PRIMARY};
+                color: {Theme.TEXT_PRIMARY};
+            }}
+        """)
+
+        layout = QVBoxLayout()
+        layout.setSpacing(14)
+
+        title = QLabel(f"Maintenance History - {self.machine_data['name']}")
+        title.setStyleSheet(f"""
+            QLabel {{
+                color: {Theme.TEXT_PRIMARY};
+                font-size: 18px;
+                font-weight: 700;
+                border: none;
+            }}
+        """)
+        layout.addWidget(title)
+
+        details = []
+        serial_number = self.machine_data.get('serial_number')
+        location = self.machine_data.get('location')
+        if serial_number:
+            details.append(f"SN: {serial_number}")
+        if location:
+            details.append(f"Location: {location}")
+        detail_label = QLabel("  •  ".join(details) if details else "Maintenance entries recorded for this equipment.")
+        detail_label.setStyleSheet(f"QLabel {{ color: {Theme.TEXT_MUTED}; font-size: 13px; border: none; }}")
+        layout.addWidget(detail_label)
+
+        filter_layout = QHBoxLayout()
+        filter_layout.setSpacing(8)
+        filter_label = QLabel("Component")
+        filter_label.setStyleSheet(f"QLabel {{ color: {Theme.TEXT_PRIMARY}; font-weight: 600; border: none; }}")
+        filter_layout.addWidget(filter_label)
+
+        self.component_filter = QComboBox()
+        self.component_filter.setStyleSheet(f"""
+            QComboBox {{
+                color: {Theme.TEXT_PRIMARY};
+                background-color: {Theme.BG_INPUT};
+                border: 1px solid {Theme.BORDER};
+                border-radius: 6px;
+                padding: 6px 10px;
+                min-width: 220px;
+            }}
+        """)
+        self.component_filter.currentIndexChanged.connect(self._refresh_table)
+        filter_layout.addWidget(self.component_filter)
+
+        sort_label = QLabel("Sort")
+        sort_label.setStyleSheet(f"QLabel {{ color: {Theme.TEXT_PRIMARY}; font-weight: 600; border: none; margin-left: 12px; }}")
+        filter_layout.addWidget(sort_label)
+
+        self.sort_order = QComboBox()
+        self.sort_order.addItem("Newest first", "desc")
+        self.sort_order.addItem("Oldest first", "asc")
+        self.sort_order.setStyleSheet(f"""
+            QComboBox {{
+                color: {Theme.TEXT_PRIMARY};
+                background-color: {Theme.BG_INPUT};
+                border: 1px solid {Theme.BORDER};
+                border-radius: 6px;
+                padding: 6px 10px;
+                min-width: 150px;
+            }}
+        """)
+        self.sort_order.currentIndexChanged.connect(self._refresh_table)
+        filter_layout.addWidget(self.sort_order)
+        filter_layout.addStretch()
+        layout.addLayout(filter_layout)
+
+        self.table = QTableWidget(0, 3)
+        self.table.setHorizontalHeaderLabels(["Date", "Component", "Notes"])
+        self.table.setAlternatingRowColors(True)
+        self.table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        self.table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        self.table.setSelectionMode(QTableWidget.SelectionMode.SingleSelection)
+        self.table.verticalHeader().setVisible(False)
+        self.table.itemSelectionChanged.connect(self._update_action_state)
+        self.table.setStyleSheet(f"""
+            QTableWidget {{
+                background-color: {Theme.BG_CARD};
+                color: {Theme.TEXT_PRIMARY};
+                gridline-color: {Theme.BORDER};
+                border: 1px solid {Theme.BORDER};
+                border-radius: 8px;
+            }}
+            QHeaderView::section {{
+                background-color: {Theme.BG_MUTED};
+                color: {Theme.TEXT_PRIMARY};
+                padding: 8px;
+                border: none;
+                font-weight: 600;
+            }}
+        """)
+        header = self.table.horizontalHeader()
+        header.setStretchLastSection(True)
+        header.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        header.setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
+        layout.addWidget(self.table, 1)
+
+        action_layout = QHBoxLayout()
+        action_layout.addStretch()
+
+        self.edit_btn = StyledButton("Edit Selected", primary=False)
+        self.edit_btn.clicked.connect(self._edit_selected_log)
+        action_layout.addWidget(self.edit_btn)
+
+        self.delete_btn = StyledButton("Delete Selected", primary=False)
+        self.delete_btn.clicked.connect(self._delete_selected_log)
+        action_layout.addWidget(self.delete_btn)
+
+        close_btn = StyledButton("Close", primary=False)
+        close_btn.clicked.connect(self.reject)
+        action_layout.addWidget(close_btn)
+        layout.addLayout(action_layout)
+
+        self.setLayout(layout)
+
+    def _load_logs(self):
+        self._all_logs = DatabaseManager.get_maintenance_history(machine_id=self.machine_data['id'])
+        self.component_filter.blockSignals(True)
+        self.component_filter.clear()
+        self.component_filter.addItem("All Components", None)
+        component_names = []
+        for component in self.machine_data.get('components', []):
+            component_name = component.get('component_name')
+            if component_name and component_name not in component_names:
+                component_names.append(component_name)
+        for component_name in sorted(component_names):
+            self.component_filter.addItem(component_name, component_name)
+        self.component_filter.blockSignals(False)
+        self._refresh_table()
+
+    def _refresh_table(self):
+        selected_component = self.component_filter.currentData()
+        logs = self._all_logs
+        if selected_component:
+            logs = [log for log in logs if log.get('component_name') == selected_component]
+
+        sort_order = self.sort_order.currentData() or "desc"
+        logs = sorted(
+            logs,
+            key=lambda log: (
+                log.get('maintenance_date', ''),
+                log.get('recorded_at', ''),
+                log.get('id', 0)
+            ),
+            reverse=(sort_order == "desc")
+        )
+
+        self._visible_logs = logs
+
+        self.table.clearSpans()
+        self.table.setRowCount(0)
+        if not logs:
+            self._update_action_state()
+            self.table.setRowCount(1)
+            empty_item = QTableWidgetItem("No maintenance history yet.")
+            empty_item.setForeground(QColor(Theme.TEXT_MUTED))
+            self.table.setItem(0, 0, empty_item)
+            self.table.setSpan(0, 0, 1, 3)
+            return
+
+        self.table.setRowCount(len(logs))
+        for row_index, entry in enumerate(logs):
+            values = [
+                entry.get('maintenance_date', ''),
+                entry.get('component_name', ''),
+                entry.get('notes') or ''
+            ]
+            for col_index, value in enumerate(values):
+                item = QTableWidgetItem(value)
+                if col_index in (0, 1):
+                    item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+                self.table.setItem(row_index, col_index, item)
+
+        self._update_action_state()
+
+    def _update_action_state(self):
+        has_selection = self._selected_log() is not None
+        self.edit_btn.setEnabled(has_selection)
+        self.delete_btn.setEnabled(has_selection)
+
+    def _selected_log(self) -> Optional[Dict]:
+        selected_rows = self.table.selectionModel().selectedRows() if self.table.selectionModel() else []
+        if not selected_rows:
+            return None
+        row = selected_rows[0].row()
+        if row < 0 or row >= len(self._visible_logs):
+            return None
+        return self._visible_logs[row]
+
+    def _refresh_parent(self):
+        parent = self.parent()
+        if parent and hasattr(parent, "_refresh_data"):
+            parent._refresh_data()
+
+    def _edit_selected_log(self):
+        log = self._selected_log()
+        if not log:
+            return
+
+        dialog = RecordMaintenanceDialog(
+            log.get('machine_name', self.machine_data['name']),
+            log.get('component_name', 'Component'),
+            self,
+            maintenance_date=log.get('maintenance_date'),
+            notes=log.get('notes')
+        )
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+
+        maintenance_date, notes = dialog.get_data()
+        if DatabaseManager.update_maintenance_log(log['id'], maintenance_date, notes):
+            self._load_logs()
+            self._refresh_parent()
+        else:
+            QMessageBox.warning(self, "Edit Failed", "Could not update the selected log entry.")
+
+    def _delete_selected_log(self):
+        log = self._selected_log()
+        if not log:
+            return
+
+        msg_box = QMessageBox(self)
+        msg_box.setWindowTitle("Delete Log Entry")
+        msg_box.setText(
+            f"Delete the maintenance entry for {log.get('component_name', 'this component')} "
+            f"on {log.get('maintenance_date', '')}?"
+        )
+        msg_box.setStandardButtons(QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+        msg_box.setStyleSheet(f"""
+            QMessageBox {{
+                background-color: {Theme.BG_PRIMARY};
+                color: {Theme.TEXT_PRIMARY};
+            }}
+            QLabel {{
+                color: {Theme.TEXT_PRIMARY};
+                background: transparent;
+                border: none;
+                font-size: 14px;
+            }}
+            QPushButton {{
+                background-color: {Theme.BG_CARD};
+                color: {Theme.TEXT_PRIMARY};
+                border: 1px solid {Theme.BORDER};
+                border-radius: 6px;
+                padding: 6px 16px;
+                min-width: 70px;
+                font-size: 13px;
+            }}
+            QPushButton:hover {{
+                background-color: {Theme.BG_MUTED};
+                border-color: {Theme.TEXT_MUTED};
+            }}
+        """)
+
+        if msg_box.exec() != QMessageBox.StandardButton.Yes:
+            return
+
+        if DatabaseManager.delete_maintenance_log(log['id']):
+            self._load_logs()
+            self._refresh_parent()
+        else:
+            QMessageBox.warning(self, "Delete Failed", "Could not delete the selected log entry.")
 class EquipmentCard(StyledCard):
     """Card widget for displaying equipment and its components."""
     
     reset_component = Signal(int)  # Signal with component ID
     edit_requested = Signal(dict)  # Signal with machine data for editing
     delete_requested = Signal(dict)  # Signal with machine data
+    history_requested = Signal(dict)  # Signal with machine data
     refresh_needed = Signal()  # Signal to refresh the card
     
     def __init__(self, machine_data: Dict, parent=None):
@@ -1316,6 +2140,26 @@ class EquipmentCard(StyledCard):
         header_layout.addWidget(name_label)
         
         header_layout.addStretch()
+
+        # Maintenance history button
+        history_btn = QPushButton("Logs")
+        history_btn.setFixedSize(48, 28)
+        history_btn.setStyleSheet(f"""
+            QPushButton {{
+                border: none;
+                background: transparent;
+                color: {Theme.TEXT_MUTED};
+                font-size: 11px;
+                font-weight: 700;
+            }}
+            QPushButton:hover {{
+                color: {Theme.PRIMARY};
+            }}
+        """)
+        history_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        history_btn.clicked.connect(lambda: self.history_requested.emit(self.machine_data))
+        history_btn.setToolTip(f"View maintenance history for {self.machine_data['name']}")
+        header_layout.addWidget(history_btn)
         
         # Delete equipment button
         delete_btn = QPushButton("✕")
@@ -1409,7 +2253,7 @@ class EquipmentCard(StyledCard):
         """Handle component deletion with confirmation."""
         msg_box = QMessageBox(self)
         msg_box.setWindowTitle("Delete Component")
-        msg_box.setText("Are you sure you want to delete this component?")
+        msg_box.setText("Are you sure you want to delete this component and its maintenance history?")
         msg_box.setStandardButtons(QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
         
         # Style the box to match dark industrial theme
@@ -1548,13 +2392,6 @@ class ComponentInputWidget(QWidget):
         layout.addWidget(self.alert_input, 2, 3)
         
         # Custom start date option
-        from PySide6.QtWidgets import QDateEdit
-        
-        # Custom date edit that disables scroll wheel
-        class NoWheelDateEdit(QDateEdit):
-            def wheelEvent(self, event):
-                event.ignore()
-        
         self.custom_start_checkbox = QCheckBox("Custom Start Date")
         self.custom_start_checkbox.setStyleSheet(f"""
             QCheckBox {{
@@ -2023,10 +2860,23 @@ class AddEquipmentDialog(QDialog):
                     self._show_error_message("Failed to update equipment. Please try again.")
                     return
                 
-                # Delete old components and add new ones
-                DatabaseManager.delete_components_by_machine_id(machine_id)
-                for comp_data in components_data:
-                    DatabaseManager.add_component(machine_id, equipment_name, comp_data)
+                existing_components = DatabaseManager.get_components_for_machine(machine_id)
+                for index, comp_data in enumerate(components_data):
+                    if index < len(existing_components):
+                        component_id = existing_components[index]['id']
+                        if not DatabaseManager.update_component(component_id, machine_id, equipment_name, comp_data):
+                            self._show_error_message("Failed to update component. Please try again.")
+                            return
+                    else:
+                        if not DatabaseManager.add_component(machine_id, equipment_name, comp_data):
+                            self._show_error_message("Failed to add component. Please try again.")
+                            return
+
+                if len(existing_components) > len(components_data):
+                    for component in existing_components[len(components_data):]:
+                        if not DatabaseManager.delete_component(component['id']):
+                            self._show_error_message("Failed to remove unused component. Please try again.")
+                            return
                 
                 self.accept()
             else:
@@ -2918,6 +3768,7 @@ class MainWindow(QMainWindow):
             card.reset_component.connect(self._reset_component)
             card.edit_requested.connect(self._edit_equipment)
             card.delete_requested.connect(self._delete_equipment)
+            card.history_requested.connect(self._view_maintenance_history)
             card.refresh_needed.connect(self._refresh_data)
             
             # Count critical and warning components
@@ -3006,47 +3857,30 @@ class MainWindow(QMainWindow):
         super().changeEvent(event)
     
     def _reset_component(self, component_id: int):
-        """Reset a component's maintenance."""
-        msg_box = QMessageBox(self)
-        msg_box.setWindowTitle("Reset Maintenance")
-        msg_box.setText("Are you sure you want to reset the maintenance for this component to today?")
-        msg_box.setStandardButtons(QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
-        
-        # Style the box to match dark industrial theme
-        msg_box.setStyleSheet(f"""
-            QMessageBox {{
-                background-color: {Theme.BG_PRIMARY};
-                color: {Theme.TEXT_PRIMARY};
-            }}
-            QLabel {{
-                color: {Theme.TEXT_PRIMARY};
-                background: transparent;
-                border: none;
-                font-size: 14px;
-            }}
-            QPushButton {{
-                background-color: {Theme.BG_CARD};
-                color: {Theme.TEXT_PRIMARY};
-                border: 1px solid {Theme.BORDER};
-                border-radius: 6px;
-                padding: 6px 16px;
-                min-width: 70px;
-                font-size: 13px;
-            }}
-            QPushButton:hover {{
-                background-color: {Theme.BG_MUTED};
-                border-color: {Theme.TEXT_MUTED};
-            }}
-        """)
-        
-        reply = msg_box.exec()
-        
-        if reply == QMessageBox.StandardButton.Yes:
-            if DatabaseManager.reset_component(component_id):
-                self._show_success_message("Maintenance reset successfully!")
+        """Record a component's maintenance completion."""
+        component = DatabaseManager.get_component_details(component_id)
+        if not component:
+            self._show_error_message("Could not load the selected component.")
+            return
+
+        dialog = RecordMaintenanceDialog(
+            component.get('machine_name', 'Unknown Equipment'),
+            component.get('component_name', 'Unknown Component'),
+            self
+        )
+
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            maintenance_date, notes = dialog.get_data()
+            if DatabaseManager.record_component_maintenance(component_id, maintenance_date, notes):
+                self._show_success_message("Maintenance recorded successfully!")
                 self._refresh_data()
             else:
-                self._show_error_message("Failed to reset maintenance.")
+                self._show_error_message("Failed to record maintenance.")
+
+    def _view_maintenance_history(self, machine_data: Dict):
+        """Open the maintenance history dialog for a machine."""
+        dialog = MaintenanceHistoryDialog(machine_data, self)
+        dialog.exec()
     
     def _show_success_message(self, message: str):
         """Show a success message with dark theme styling."""
