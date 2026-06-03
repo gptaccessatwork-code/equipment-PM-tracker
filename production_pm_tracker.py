@@ -2343,9 +2343,18 @@ class ComponentInputWidget(QWidget):
         self._setup_ui()
     
     def _setup_ui(self):
-        layout = QGridLayout()
-        layout.setContentsMargins(16, 12, 16, 12)
-        layout.setSpacing(12)
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        outer_layout = QVBoxLayout(self)
+        outer_layout.setContentsMargins(0, 0, 0, 0)
+        outer_layout.setSpacing(0)
+
+        card = QFrame()
+        card.setObjectName("componentInputCard")
+        card.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        card_layout = QGridLayout(card)
+        card_layout.setContentsMargins(18, 14, 18, 14)
+        card_layout.setHorizontalSpacing(14)
+        card_layout.setVerticalSpacing(14)
         
         # Component number header with delete button
         header_layout = QHBoxLayout()
@@ -2384,33 +2393,33 @@ class ComponentInputWidget(QWidget):
         delete_btn.setToolTip("Remove this component")
         header_layout.addWidget(delete_btn)
         
-        layout.addLayout(header_layout, 0, 0, 1, 4)
+        card_layout.addLayout(header_layout, 0, 0, 1, 4)
         
         # Component name
         name_label = QLabel("Name:")
         name_label.setStyleSheet(f"QLabel {{ color: {Theme.TEXT_MUTED}; font-size: 12px; border: none; background-color: transparent; }}")
-        layout.addWidget(name_label, 1, 0)
+        card_layout.addWidget(name_label, 1, 0)
         
         self.name_input = StyledLineEdit("e.g., Calibration")
         self.name_input.setMaxLength(20)
-        layout.addWidget(self.name_input, 1, 1, 1, 2)
+        card_layout.addWidget(self.name_input, 1, 1, 1, 2)
         
         # Interval days
         interval_label = QLabel("Interval (days):")
         interval_label.setStyleSheet(f"QLabel {{ color: {Theme.TEXT_MUTED}; font-size: 12px; border: none; background-color: transparent; }}")
-        layout.addWidget(interval_label, 2, 0)
+        card_layout.addWidget(interval_label, 2, 0)
         
         self.interval_input = StyledSpinBox()
-        layout.addWidget(self.interval_input, 2, 1)
+        card_layout.addWidget(self.interval_input, 2, 1)
         
         # Alert threshold
         alert_label = QLabel("Alert (days):")
         alert_label.setStyleSheet(f"QLabel {{ color: {Theme.TEXT_MUTED}; font-size: 12px; border: none; background-color: transparent; }}")
-        layout.addWidget(alert_label, 2, 2)
+        card_layout.addWidget(alert_label, 2, 2)
         
         self.alert_input = StyledSpinBox()
         self.alert_input.setValue(5)
-        layout.addWidget(self.alert_input, 2, 3)
+        card_layout.addWidget(self.alert_input, 2, 3)
         
         # Custom start date option
         self.custom_start_checkbox = QCheckBox("Custom Start Date")
@@ -2510,11 +2519,21 @@ class ComponentInputWidget(QWidget):
         """)
         self.custom_start_checkbox.stateChanged.connect(self._on_custom_start_changed)
         
-        layout.addWidget(self.custom_start_checkbox, 3, 0, 1, 4)
-        layout.addWidget(self.custom_start_date, 4, 0, 1, 4)
-        
-        self.setLayout(layout)
-        self.setStyleSheet("QWidget { background-color: transparent; border: none; }")
+        card_layout.addWidget(self.custom_start_checkbox, 3, 0, 1, 4)
+        card_layout.addWidget(self.custom_start_date, 4, 0, 1, 4)
+
+        card.setStyleSheet(f"""
+            QFrame#componentInputCard {{
+                background-color: {Theme.BG_CARD};
+                border: 1px solid rgba(148, 163, 184, 0.7);
+                border-radius: 14px;
+            }}
+            QFrame#componentInputCard:hover {{
+                border: 1px solid {Theme.PRIMARY};
+            }}
+        """)
+
+        outer_layout.addWidget(card)
     
     def _on_custom_start_changed(self, state):
         """Handle custom start date checkbox state change."""
@@ -2564,7 +2583,9 @@ class AddEquipmentDialog(QDialog):
     def _setup_ui(self):
         title_text = "Edit Equipment" if self.is_edit_mode else "Add Equipment"
         self.setWindowTitle(title_text)
-        self.setMinimumWidth(550)
+        self.resize(820, 780)
+        self.setMinimumWidth(760)
+        self.setMinimumHeight(920)
         self.setStyleSheet(f"""
             QDialog {{
                 background-color: {Theme.BG_PRIMARY};
@@ -2673,7 +2694,7 @@ class AddEquipmentDialog(QDialog):
         # Scroll area for components
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
-        scroll.setMaximumHeight(280)
+        scroll.setMaximumHeight(460)
         scroll.setStyleSheet(f"""
             QScrollArea {{
                 border: none;
@@ -2701,7 +2722,7 @@ class AddEquipmentDialog(QDialog):
         
         self.components_container = QWidget()
         self.components_layout = QVBoxLayout()
-        self.components_layout.setSpacing(12)
+        self.components_layout.setSpacing(14)
         self.components_container.setLayout(self.components_layout)
         self.components_container.setStyleSheet("""
             QWidget {
