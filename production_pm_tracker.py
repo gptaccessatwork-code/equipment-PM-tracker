@@ -31,7 +31,7 @@ from PySide6.QtWidgets import (
     QScrollArea, QFrame, QGridLayout, QMessageBox, QSystemTrayIcon,
     QMenu, QProgressBar, QSpinBox, QDoubleSpinBox, QCheckBox,
     QComboBox, QGroupBox, QSplitter, QSpacerItem, QSizePolicy, QAbstractSpinBox,
-    QTableWidget, QTableWidgetItem, QHeaderView, QTextEdit
+    QTableWidget, QTableWidgetItem, QHeaderView, QTextEdit, QTabBar, QInputDialog
 )
 from PySide6.QtCore import Qt, QTimer, QSize, Signal, QObject, QEvent, QPoint
 from PySide6.QtWidgets import QDateEdit
@@ -107,6 +107,19 @@ def init_database():
     """Initialize the SQLite database with the required schema."""
     with get_db_connection() as conn:
         cursor = conn.cursor()
+
+        # Create sheets table so each tab can stay isolated
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS sheets (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL UNIQUE,
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        cursor.execute("""
+            INSERT OR IGNORE INTO sheets (id, name, created_at)
+            VALUES (1, 'Default', CURRENT_TIMESTAMP)
+        """)
         
         # Create machines table without UNIQUE constraint on name
         cursor.execute("""
@@ -115,6 +128,7 @@ def init_database():
                 name TEXT NOT NULL,
                 serial_number TEXT,
                 location TEXT,
+                sheet_id INTEGER NOT NULL DEFAULT 1,
                 created_at TEXT DEFAULT CURRENT_TIMESTAMP
             )
         """) 
@@ -132,14 +146,15 @@ def init_database():
                         name TEXT NOT NULL,
                         serial_number TEXT,
                         location TEXT,
+                        sheet_id INTEGER NOT NULL DEFAULT 1,
                         created_at TEXT DEFAULT CURRENT_TIMESTAMP
                     )
                 """)
                 
                 # Copy data from old table to new table
                 cursor.execute("""
-                    INSERT INTO machines_new (id, name, serial_number, location, created_at)
-                    SELECT id, name, serial_number, location, created_at FROM machines
+                    INSERT INTO machines_new (id, name, serial_number, location, sheet_id, created_at)
+                    SELECT id, name, serial_number, location, COALESCE(sheet_id, 1), created_at FROM machines
                 """)
                 
                 # Drop old table
@@ -160,6 +175,16 @@ def init_database():
             cursor.execute("ALTER TABLE machines ADD COLUMN location TEXT")
         except sqlite3.OperationalError:
             pass  # Column already exists 
+
+        try:
+            cursor.execute("ALTER TABLE machines ADD COLUMN sheet_id INTEGER NOT NULL DEFAULT 1")
+        except sqlite3.OperationalError:
+            pass
+
+        try:
+            cursor.execute("UPDATE machines SET sheet_id = COALESCE(sheet_id, 1)")
+        except sqlite3.OperationalError:
+            pass
         
         # Create components table with a real equipment tag
         cursor.execute("""
@@ -266,6 +291,7 @@ def init_database():
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 machine_id INTEGER NOT NULL,
                 component_id INTEGER NOT NULL,
+                sheet_id INTEGER NOT NULL DEFAULT 1,
                 machine_name TEXT NOT NULL,
                 component_name TEXT NOT NULL,
                 maintenance_date TEXT NOT NULL,
@@ -293,11 +319,22 @@ def init_database():
             """)
         except sqlite3.OperationalError:
             pass
+
+        try:
+            cursor.execute("ALTER TABLE maintenance_log ADD COLUMN sheet_id INTEGER NOT NULL DEFAULT 1")
+        except sqlite3.OperationalError:
+            pass
+
+        try:
+            cursor.execute("UPDATE maintenance_log SET sheet_id = COALESCE(sheet_id, 1)")
+        except sqlite3.OperationalError:
+            pass
         
         # Create email_log table to track one reminder per day
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS email_log (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+                sheet_id INTEGER NOT NULL DEFAULT 1,
                 sent_date TEXT NOT NULL,
                 sent_at TEXT NOT NULL,
                 components_count INTEGER NOT NULL DEFAULT 0,
@@ -314,12 +351,12 @@ def init_database():
                 WHERE id NOT IN (
                     SELECT MAX(id)
                     FROM email_log
-                    GROUP BY sent_date
+                    GROUP BY sent_date, sheet_id
                 )
             """)
             cursor.execute("""
                 CREATE UNIQUE INDEX IF NOT EXISTS idx_email_log_sent_date
-                ON email_log(sent_date)
+                ON email_log(sent_date, sheet_id)
             """)
         except sqlite3.OperationalError:
             pass
@@ -334,6 +371,16 @@ def init_database():
             cursor.execute("ALTER TABLE email_log ADD COLUMN error_message TEXT")
         except sqlite3.OperationalError:
             pass
+
+        try:
+            cursor.execute("ALTER TABLE email_log ADD COLUMN sheet_id INTEGER NOT NULL DEFAULT 1")
+        except sqlite3.OperationalError:
+            pass
+
+        try:
+            cursor.execute("UPDATE email_log SET sheet_id = COALESCE(sheet_id, 1)")
+        except sqlite3.OperationalError:
+            pass
         
         conn.commit()
 
@@ -344,14 +391,83 @@ class DatabaseManager:
     """Handle all database operations."""
     
     @staticmethod
-    def add_machine(name: str, serial_number: str = None, location: str = None) -> Optional[int]:
+    def get_sheets() -> List[Dict]:
+        """Get all sheet tabs."""
+        try:
+            with get_db_connection() as conn:
+                conn.row_factory = sqlite3.Row
+                cursor = conn.cursor()
+                cursor.execute("SELECT * FROM sheets ORDER BY id")
+                return [dict(row) for row in cursor.fetchall()]
+        except Exception as e:
+            print(f"Error getting sheets: {e}")
+            return []
+
+    @staticmethod
+    def add_sheet(name: str) -> Optional[int]:
+        """Add a new sheet tab."""
+        try:
+            with get_db_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute(
+                    "INSERT INTO sheets (name) VALUES (?)",
+                    (name.strip(),)
+                )
+                conn.commit()
+                return cursor.lastrowid
+        except Exception as e:
+            print(f"Error adding sheet: {e}")
+            return None
+
+    @staticmethod
+    def update_sheet_name(sheet_id: int, new_name: str) -> bool:
+        """Rename a sheet tab."""
+        try:
+            with get_db_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute(
+                    "UPDATE sheets SET name = ? WHERE id = ?",
+                    (new_name.strip(), sheet_id)
+                )
+                conn.commit()
+                return cursor.rowcount > 0
+        except Exception as e:
+            print(f"Error updating sheet name: {e}")
+            return False
+
+    @staticmethod
+    def delete_sheet(sheet_id: int) -> bool:
+        """Delete a sheet and all data attached to it."""
+        if sheet_id == 1:
+            return False
+
+        try:
+            with get_db_connection() as conn:
+                cursor = conn.cursor()
+
+                cursor.execute("DELETE FROM email_log WHERE sheet_id = ?", (sheet_id,))
+                cursor.execute("DELETE FROM maintenance_log WHERE sheet_id = ?", (sheet_id,))
+                cursor.execute("SELECT id FROM machines WHERE sheet_id = ?", (sheet_id,))
+                machine_ids = [row[0] for row in cursor.fetchall()]
+                for machine_id in machine_ids:
+                    cursor.execute("DELETE FROM machines WHERE id = ?", (machine_id,))
+                cursor.execute("DELETE FROM sheets WHERE id = ?", (sheet_id,))
+
+                conn.commit()
+                return True
+        except Exception as e:
+            print(f"Error deleting sheet: {e}")
+            return False
+
+    @staticmethod
+    def add_machine(name: str, serial_number: str = None, location: str = None, sheet_id: int = 1) -> Optional[int]:
         """Add a new machine and return its database id."""
         try:
             with get_db_connection() as conn:
                 cursor = conn.cursor()
                 cursor.execute(
-                    "INSERT INTO machines (name, serial_number, location) VALUES (?, ?, ?)",
-                    (name, serial_number, location)
+                    "INSERT INTO machines (name, serial_number, location, sheet_id) VALUES (?, ?, ?, ?)",
+                    (name, serial_number, location, sheet_id)
                 )
                 conn.commit()
                 return cursor.lastrowid
@@ -548,7 +664,8 @@ class DatabaseManager:
                         c.*,
                         COALESCE(m.name, c.parent_machine_name) AS machine_name,
                         m.serial_number AS machine_serial_number,
-                        m.location AS machine_location
+                        m.location AS machine_location,
+                        m.sheet_id AS sheet_id
                     FROM components c
                     LEFT JOIN machines m ON c.machine_id = m.id
                     WHERE c.id = ?
@@ -560,14 +677,17 @@ class DatabaseManager:
             return None
     
     @staticmethod
-    def get_all_machines() -> List[Dict]:
+    def get_all_machines(sheet_id: Optional[int] = None) -> List[Dict]:
         """Get all machines with their components."""
         try:
             with get_db_connection() as conn:
                 conn.row_factory = sqlite3.Row
                 cursor = conn.cursor()
-                
-                cursor.execute("SELECT * FROM machines ORDER BY name")
+
+                if sheet_id is None:
+                    cursor.execute("SELECT * FROM machines ORDER BY name")
+                else:
+                    cursor.execute("SELECT * FROM machines WHERE sheet_id = ? ORDER BY name", (sheet_id,))
                 machines = []
                 
                 for row in cursor.fetchall():
@@ -631,7 +751,8 @@ class DatabaseManager:
                     SELECT
                         c.*,
                         COALESCE(m.name, c.parent_machine_name) AS machine_name,
-                        m.serial_number AS machine_serial_number
+                        m.serial_number AS machine_serial_number,
+                        m.sheet_id AS sheet_id
                     FROM components c
                     LEFT JOIN machines m ON c.machine_id = m.id
                     WHERE c.id = ?
@@ -661,12 +782,13 @@ class DatabaseManager:
 
                 cursor.execute("""
                     INSERT INTO maintenance_log (
-                        machine_id, component_id, machine_name, component_name,
+                        machine_id, component_id, sheet_id, machine_name, component_name,
                         maintenance_date, recorded_at, pm_interval_days, next_due_date, notes
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """, (
                     component['machine_id'],
                     component_id,
+                    component.get('sheet_id', 1),
                     component['machine_name'],
                     component['component_name'],
                     performed_date,
@@ -685,7 +807,7 @@ class DatabaseManager:
             return False
 
     @staticmethod
-    def update_maintenance_log(log_id: int, maintenance_date: str, notes: Optional[str] = None) -> bool:
+    def update_maintenance_log(log_id: int, maintenance_date: str, notes: Optional[str] = None, sheet_id: int = 1) -> bool:
         """Edit a maintenance log entry and recalculate the component schedule."""
         try:
             with get_db_connection() as conn:
@@ -694,8 +816,8 @@ class DatabaseManager:
                 cursor.execute("""
                     SELECT component_id
                     FROM maintenance_log
-                    WHERE id = ?
-                """, (log_id,))
+                    WHERE id = ? AND sheet_id = ?
+                """, (log_id, sheet_id))
                 log_row = cursor.fetchone()
                 if not log_row:
                     return False
@@ -743,7 +865,7 @@ class DatabaseManager:
             return False
 
     @staticmethod
-    def delete_maintenance_log(log_id: int) -> bool:
+    def delete_maintenance_log(log_id: int, sheet_id: int = 1) -> bool:
         """Delete a maintenance log entry and recalculate the component schedule."""
         try:
             with get_db_connection() as conn:
@@ -752,14 +874,14 @@ class DatabaseManager:
                 cursor.execute("""
                     SELECT component_id
                     FROM maintenance_log
-                    WHERE id = ?
-                """, (log_id,))
+                    WHERE id = ? AND sheet_id = ?
+                """, (log_id, sheet_id))
                 log_row = cursor.fetchone()
                 if not log_row:
                     return False
 
                 component_id = log_row["component_id"]
-                cursor.execute("DELETE FROM maintenance_log WHERE id = ?", (log_id,))
+                cursor.execute("DELETE FROM maintenance_log WHERE id = ? AND sheet_id = ?", (log_id, sheet_id))
                 if cursor.rowcount <= 0:
                     return False
                 if not DatabaseManager._apply_component_schedule_state(cursor, component_id):
@@ -798,31 +920,35 @@ class DatabaseManager:
             return False
     
     @staticmethod
-    def was_email_sent_today(sent_date: str) -> bool:
-        """Check if today's reminder has already been claimed or sent."""
+    def was_email_sent_today(sent_date: str, sheet_id: int = 1) -> bool:
+        """Check if today's reminder has already been claimed or sent for a sheet."""
         try:
             with get_db_connection() as conn:
+                conn.row_factory = sqlite3.Row
                 cursor = conn.cursor()
                 cursor.execute("""
-                    SELECT 1 FROM email_log WHERE sent_date = ? LIMIT 1
-                """, (sent_date,))
+                    SELECT 1
+                    FROM email_log
+                    WHERE sent_date = ? AND sheet_id = ?
+                    LIMIT 1
+                """, (sent_date, sheet_id))
                 return cursor.fetchone() is not None
         except Exception as e:
             print(f"Error checking email log: {e}")
             return False
 
     @staticmethod
-    def claim_daily_email(sent_date: str) -> bool:
+    def claim_daily_email(sent_date: str, sheet_id: int = 1) -> bool:
         """Claim today's reminder slot before sending to prevent duplicates."""
         try:
             with get_db_connection() as conn:
                 cursor = conn.cursor()
                 cursor.execute("""
                     INSERT INTO email_log (
-                        sent_date, sent_at, components_count, recipients, status, error_message
+                        sheet_id, sent_date, sent_at, components_count, recipients, status, error_message
                     )
-                    VALUES (?, ?, 0, '', 'sending', NULL)
-                """, (sent_date, datetime.now().isoformat()))
+                    VALUES (?, ?, ?, 0, '', 'sending', NULL)
+                """, (sheet_id, sent_date, datetime.now().isoformat()))
                 conn.commit()
                 return True
         except sqlite3.IntegrityError:
@@ -832,7 +958,7 @@ class DatabaseManager:
             return False
 
     @staticmethod
-    def mark_email_sent(sent_date: str, components_count: int, recipients: str) -> bool:
+    def mark_email_sent(sent_date: str, components_count: int, recipients: str, sheet_id: int = 1) -> bool:
         """Update the daily reminder row after a successful send."""
         try:
             with get_db_connection() as conn:
@@ -840,8 +966,8 @@ class DatabaseManager:
                 cursor.execute("""
                     UPDATE email_log
                     SET sent_at = ?, components_count = ?, recipients = ?, status = 'sent', error_message = NULL
-                    WHERE sent_date = ?
-                """, (datetime.now().isoformat(), components_count, recipients, sent_date))
+                    WHERE sent_date = ? AND sheet_id = ?
+                """, (datetime.now().isoformat(), components_count, recipients, sent_date, sheet_id))
                 conn.commit()
                 return cursor.rowcount > 0
         except Exception as e:
@@ -849,7 +975,7 @@ class DatabaseManager:
             return False
 
     @staticmethod
-    def mark_email_failed(sent_date: str, error_message: str) -> bool:
+    def mark_email_failed(sent_date: str, error_message: str, sheet_id: int = 1) -> bool:
         """Record a failed send attempt for today's reminder."""
         try:
             with get_db_connection() as conn:
@@ -857,8 +983,8 @@ class DatabaseManager:
                 cursor.execute("""
                     UPDATE email_log
                     SET status = 'failed', error_message = ?
-                    WHERE sent_date = ?
-                """, (error_message, sent_date))
+                    WHERE sent_date = ? AND sheet_id = ?
+                """, (error_message, sent_date, sheet_id))
                 conn.commit()
                 return cursor.rowcount > 0
         except Exception as e:
@@ -934,23 +1060,30 @@ class DatabaseManager:
             return False
     
     @staticmethod
-    def get_components_due_soon() -> List[Dict]:
+    def get_components_due_soon(sheet_id: Optional[int] = None) -> List[Dict]:
         """Get components that are due soon or overdue."""
         try:
             with get_db_connection() as conn:
                 conn.row_factory = sqlite3.Row
                 cursor = conn.cursor()
-                
-                cursor.execute("""
+
+                query = """
                     SELECT
                         c.*,
                         COALESCE(m.name, c.parent_machine_name) as machine_name,
-                        m.serial_number as machine_serial_number
+                        m.serial_number as machine_serial_number,
+                        m.sheet_id as sheet_id
                     FROM components c
                     LEFT JOIN machines m ON c.machine_id = m.id
                     WHERE c.next_due_date IS NOT NULL
                     ORDER BY c.next_due_date ASC
-                """)
+                """
+                params = []
+                if sheet_id is not None:
+                    query = query.replace("WHERE c.next_due_date IS NOT NULL", "WHERE c.next_due_date IS NOT NULL AND m.sheet_id = ?")
+                    params.append(sheet_id)
+
+                cursor.execute(query, params)
                 
                 due_components = []
                 for row in cursor.fetchall():
@@ -970,7 +1103,7 @@ class DatabaseManager:
             return []
 
     @staticmethod
-    def get_maintenance_history(machine_id: Optional[int] = None, component_id: Optional[int] = None) -> List[Dict]:
+    def get_maintenance_history(sheet_id: Optional[int] = None, machine_id: Optional[int] = None, component_id: Optional[int] = None) -> List[Dict]:
         """Get maintenance log entries for a machine or component."""
         try:
             with get_db_connection() as conn:
@@ -989,6 +1122,9 @@ class DatabaseManager:
                 if component_id is not None:
                     filters.append("component_id = ?")
                     params.append(component_id)
+                if sheet_id is not None:
+                    filters.append("sheet_id = ?")
+                    params.append(sheet_id)
                 if filters:
                     query += " WHERE " + " AND ".join(filters)
                 query += " ORDER BY maintenance_date DESC, recorded_at DESC, id DESC"
@@ -1084,18 +1220,18 @@ class EmailConfig:
             }
         ]
         
-        subject, html = EmailConfig.build_alert_email(test_components)
+        subject, html = EmailConfig.build_alert_email(test_components, sheet_name="Default")
         # Add [TEST] prefix to subject
         subject = "[TEST] " + subject
         
         return EmailConfig.send_email(config, subject, html)
     
     @staticmethod
-    def build_alert_email(components: List[Dict]) -> tuple[str, str]:
+    def build_alert_email(components: List[Dict], sheet_name: str = "Default") -> tuple[str, str]:
         """Build INFICON-style grouped HTML email content."""
         today_str = datetime.now().strftime("%d %b %Y")
         total = len(components)
-        subject = f"[PM Tracker] Maintenance Due Within 30 Days — {today_str}"
+        subject = f"[PM Tracker] {sheet_name}: Maintenance Due Within 30 Days — {today_str}"
         
         def _status_label(days):
             if days <= 0: return "#fca5a5", "OVERDUE"
@@ -1197,7 +1333,7 @@ class EmailConfig:
   <!-- Header -->
   <tr>
     <td style="background:#5fd1c8;border-radius:8px 8px 0 0;padding:28px 32px;">
-      <div style="font-size:20px;font-weight:700;color:#fff;">Equipment Maintenance Alert</div>
+      <div style="font-size:20px;font-weight:700;color:#fff;">Equipment Maintenance Alert - {sheet_name}</div>
       <div style="font-size:13px;color:#a0c0e8;margin-top:6px;">
         {today_str} &nbsp;|&nbsp; {total} component(s) require attention
         across {len(machines)} equipment
@@ -1270,28 +1406,41 @@ class EmailNotificationThread(threading.Thread):
             return
         
         today = date.today().isoformat()
-        if DatabaseManager.was_email_sent_today(today):
-            return  # Already sent today
+        sheets = DatabaseManager.get_sheets()
+        sent_count = 0
+        failed_count = 0
 
-        due_components = DatabaseManager.get_components_due_soon()
-        
-        if not due_components:
-            return
+        for sheet in sheets:
+            sheet_id = sheet.get('id', 1)
+            sheet_name = sheet.get('name', 'Default')
 
-        if not DatabaseManager.claim_daily_email(today):
-            return  # Another app instance already claimed today's reminder
-        
-        subject, html = EmailConfig.build_alert_email(due_components)
-        success, error = EmailConfig.send_email(config, subject, html)
-        
-        if success:
-            DatabaseManager.mark_email_sent(today, len(due_components), ", ".join(config.get('to_addrs', [])))
-            if self._callback:
-                self._callback(f"Email sent: {len(due_components)} components alerted")
-        else:
-            DatabaseManager.mark_email_failed(today, error)
-            if self._callback:
-                self._callback(f"Email failed: {error}")
+            if DatabaseManager.was_email_sent_today(today, sheet_id):
+                continue
+
+            due_components = DatabaseManager.get_components_due_soon(sheet_id)
+            if not due_components:
+                continue
+
+            if not DatabaseManager.claim_daily_email(today, sheet_id):
+                continue
+
+            subject, html = EmailConfig.build_alert_email(due_components, sheet_name=sheet_name)
+            success, error = EmailConfig.send_email(config, subject, html)
+
+            if success:
+                DatabaseManager.mark_email_sent(
+                    today,
+                    len(due_components),
+                    ", ".join(config.get('to_addrs', [])),
+                    sheet_id
+                )
+                sent_count += 1
+            else:
+                DatabaseManager.mark_email_failed(today, error, sheet_id)
+                failed_count += 1
+
+        if self._callback and (sent_count or failed_count):
+            self._callback(f"Email run complete: {sent_count} sheet(s) sent, {failed_count} failed")
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  STYLED WIDGETS
@@ -1838,9 +1987,10 @@ class RecordMaintenanceDialog(QDialog):
 class MaintenanceHistoryDialog(QDialog):
     """Dialog for reviewing maintenance history for an equipment item."""
 
-    def __init__(self, machine_data: Dict, parent=None):
+    def __init__(self, machine_data: Dict, sheet_id: int = 1, parent=None):
         super().__init__(parent)
         self.machine_data = machine_data
+        self.sheet_id = sheet_id
         self._all_logs = []
         self._visible_logs = []
         self._setup_ui()
@@ -1973,7 +2123,7 @@ class MaintenanceHistoryDialog(QDialog):
         self.setLayout(layout)
 
     def _load_logs(self):
-        self._all_logs = DatabaseManager.get_maintenance_history(machine_id=self.machine_data['id'])
+        self._all_logs = DatabaseManager.get_maintenance_history(sheet_id=self.sheet_id, machine_id=self.machine_data['id'])
         self.component_filter.blockSignals(True)
         self.component_filter.clear()
         self.component_filter.addItem("All Components", None)
@@ -2067,7 +2217,7 @@ class MaintenanceHistoryDialog(QDialog):
             return
 
         maintenance_date, notes = dialog.get_data()
-        if DatabaseManager.update_maintenance_log(log['id'], maintenance_date, notes):
+        if DatabaseManager.update_maintenance_log(log['id'], maintenance_date, notes, self.sheet_id):
             self._load_logs()
             self._refresh_parent()
         else:
@@ -2114,11 +2264,215 @@ class MaintenanceHistoryDialog(QDialog):
         if msg_box.exec() != QMessageBox.StandardButton.Yes:
             return
 
-        if DatabaseManager.delete_maintenance_log(log['id']):
+        if DatabaseManager.delete_maintenance_log(log['id'], self.sheet_id):
             self._load_logs()
             self._refresh_parent()
         else:
             QMessageBox.warning(self, "Delete Failed", "Could not delete the selected log entry.")
+
+class SheetManagementDialog(QDialog):
+    """Dialog for renaming and deleting sheet tabs."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._setup_ui()
+        self._load_sheets()
+
+    def _setup_ui(self):
+        self.setWindowTitle("Manage Sheets")
+        self.setMinimumSize(620, 380)
+        self.setStyleSheet(f"""
+            QDialog {{
+                background-color: {Theme.BG_PRIMARY};
+                color: {Theme.TEXT_PRIMARY};
+            }}
+        """)
+
+        layout = QVBoxLayout()
+        layout.setSpacing(14)
+
+        title = QLabel("Manage Sheets")
+        title.setStyleSheet(f"""
+            QLabel {{
+                color: {Theme.TEXT_PRIMARY};
+                font-size: 18px;
+                font-weight: 700;
+                border: none;
+            }}
+        """)
+        layout.addWidget(title)
+
+        hint = QLabel("Rename sheets or delete a sheet and everything inside it.")
+        hint.setStyleSheet(f"QLabel {{ color: {Theme.TEXT_MUTED}; font-size: 13px; border: none; }}")
+        layout.addWidget(hint)
+
+        self.table = QTableWidget(0, 3)
+        self.table.setHorizontalHeaderLabels(["ID", "Sheet", "Items"])
+        self.table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        self.table.setSelectionMode(QTableWidget.SelectionMode.SingleSelection)
+        self.table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        self.table.verticalHeader().setVisible(False)
+        self.table.setStyleSheet(f"""
+            QTableWidget {{
+                background-color: {Theme.BG_CARD};
+                color: {Theme.TEXT_PRIMARY};
+                gridline-color: {Theme.BORDER};
+                border: 1px solid {Theme.BORDER};
+                border-radius: 8px;
+            }}
+            QHeaderView::section {{
+                background-color: {Theme.BG_MUTED};
+                color: {Theme.TEXT_PRIMARY};
+                padding: 8px;
+                border: none;
+                font-weight: 600;
+            }}
+        """)
+        header = self.table.horizontalHeader()
+        header.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        header.setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
+        layout.addWidget(self.table, 1)
+
+        button_row = QHBoxLayout()
+        button_row.addStretch()
+
+        self.rename_btn = StyledButton("Rename", primary=False)
+        self.rename_btn.clicked.connect(self._rename_selected)
+        button_row.addWidget(self.rename_btn)
+
+        self.delete_btn = StyledButton("Delete", primary=False)
+        self.delete_btn.clicked.connect(self._delete_selected)
+        button_row.addWidget(self.delete_btn)
+
+        close_btn = StyledButton("Close", primary=False)
+        close_btn.clicked.connect(self.reject)
+        button_row.addWidget(close_btn)
+
+        layout.addLayout(button_row)
+        self.setLayout(layout)
+
+    def _load_sheets(self):
+        sheets = DatabaseManager.get_sheets()
+        self.table.setRowCount(len(sheets))
+        for row_index, sheet in enumerate(sheets):
+            sheet_id = sheet.get("id", 1)
+            item_count = self._count_items(sheet_id)
+
+            id_item = QTableWidgetItem(str(sheet_id))
+            id_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+            name_item = QTableWidgetItem(sheet.get("name", "Sheet"))
+            items_item = QTableWidgetItem(str(item_count))
+            items_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+
+            self.table.setItem(row_index, 0, id_item)
+            self.table.setItem(row_index, 1, name_item)
+            self.table.setItem(row_index, 2, items_item)
+
+    def _count_items(self, sheet_id: int) -> int:
+        machines = DatabaseManager.get_all_machines(sheet_id)
+        return sum(len(machine.get("components", [])) for machine in machines)
+
+    def _selected_sheet(self) -> Optional[Dict]:
+        selected_rows = self.table.selectionModel().selectedRows() if self.table.selectionModel() else []
+        if not selected_rows:
+            return None
+        row = selected_rows[0].row()
+        if row < 0 or row >= self.table.rowCount():
+            return None
+        sheet_id_item = self.table.item(row, 0)
+        name_item = self.table.item(row, 1)
+        if not sheet_id_item or not name_item:
+            return None
+        try:
+            sheet_id = int(sheet_id_item.text())
+        except ValueError:
+            return None
+        return {"id": sheet_id, "name": name_item.text()}
+
+    def _rename_selected(self):
+        sheet = self._selected_sheet()
+        if not sheet:
+            return
+
+        new_name, accepted = QInputDialog.getText(
+            self,
+            "Rename Sheet",
+            "Enter a new sheet name:",
+            QLineEdit.EchoMode.Normal,
+            sheet["name"]
+        )
+        if not accepted:
+            return
+
+        new_name = new_name.strip()
+        if not new_name:
+            QMessageBox.warning(self, "Invalid Name", "Please enter a sheet name.")
+            return
+
+        if new_name == sheet["name"]:
+            return
+
+        if not DatabaseManager.update_sheet_name(sheet["id"], new_name):
+            QMessageBox.warning(self, "Rename Failed", "Could not rename the sheet.")
+            return
+
+        self._load_sheets()
+        self._refresh_parent()
+
+    def _delete_selected(self):
+        sheet = self._selected_sheet()
+        if not sheet:
+            return
+
+        if sheet["id"] == 1:
+            QMessageBox.information(self, "Default Sheet", "The Default sheet cannot be deleted.")
+            return
+
+        msg_box = QMessageBox(self)
+        msg_box.setWindowTitle("Delete Sheet")
+        msg_box.setText(
+            f"Delete '{sheet['name']}' and all equipment, components, maintenance logs, and reminder history inside it?"
+        )
+        msg_box.setStandardButtons(QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+        msg_box.setStyleSheet(f"""
+            QMessageBox {{
+                background-color: {Theme.BG_PRIMARY};
+                color: {Theme.TEXT_PRIMARY};
+            }}
+            QLabel {{
+                color: {Theme.TEXT_PRIMARY};
+                background: transparent;
+                border: none;
+                font-size: 14px;
+            }}
+            QPushButton {{
+                background-color: {Theme.BG_CARD};
+                color: {Theme.TEXT_PRIMARY};
+                border: 1px solid {Theme.BORDER};
+                border-radius: 6px;
+                padding: 6px 16px;
+                min-width: 70px;
+                font-size: 13px;
+            }}
+            QPushButton:hover {{
+                background-color: {Theme.BG_MUTED};
+                border-color: {Theme.TEXT_MUTED};
+            }}
+        """)
+        if msg_box.exec() != QMessageBox.StandardButton.Yes:
+            return
+
+        if DatabaseManager.delete_sheet(sheet["id"]):
+            self._load_sheets()
+            self._refresh_parent()
+        else:
+            QMessageBox.warning(self, "Delete Failed", "Could not delete the selected sheet.")
+
+    def _refresh_parent(self):
+        parent = self.parent()
+        if parent and hasattr(parent, "_load_sheet_tabs"):
+            parent._load_sheet_tabs()
 class EquipmentCard(StyledCard):
     """Card widget for displaying equipment and its components."""
     
@@ -2571,9 +2925,10 @@ class ComponentInputWidget(QWidget):
 class AddEquipmentDialog(QDialog):
     """Dialog for adding or editing equipment with components."""
     
-    def __init__(self, machine_data: Optional[Dict] = None, parent=None):
+    def __init__(self, machine_data: Optional[Dict] = None, sheet_id: int = 1, parent=None):
         super().__init__(parent)
         self.machine_data = machine_data
+        self.sheet_id = machine_data.get('sheet_id', sheet_id) if machine_data else sheet_id
         self.is_edit_mode = machine_data is not None
         self.component_widgets = []
         self._setup_ui()
@@ -2923,7 +3278,7 @@ class AddEquipmentDialog(QDialog):
                 self.accept()
             else:
                 # Add new machine to database
-                machine_id = DatabaseManager.add_machine(equipment_name, serial_number, location)
+                machine_id = DatabaseManager.add_machine(equipment_name, serial_number, location, self.sheet_id)
                 if machine_id is not None:
                     # Add components
                     for comp_data in components_data:
@@ -3244,6 +3599,8 @@ class MainWindow(QMainWindow):
         self.email_thread = None
         self.active_metric_filter = None
         self.search_query = ""
+        self.current_sheet_id = 1
+        self.sheets = []
         self._setup_ui()
         self._setup_tray()
         self._start_email_thread()
@@ -3332,7 +3689,113 @@ class MainWindow(QMainWindow):
         content_layout.setContentsMargins(24, 24, 24, 24)
         content_layout.setSpacing(24)
         content_margins = content_layout.contentsMargins()
-        
+
+        # Sheet tabs
+        sheet_row = QHBoxLayout()
+        sheet_row.setContentsMargins(0, 0, 0, 0)
+        sheet_row.setSpacing(10)
+
+        self.sheet_tabs = QTabBar()
+        self.sheet_tabs.setMovable(False)
+        self.sheet_tabs.setExpanding(False)
+        self.sheet_tabs.setDocumentMode(True)
+        self.sheet_tabs.setDrawBase(False)
+        self.sheet_tabs.setElideMode(Qt.TextElideMode.ElideRight)
+        self.sheet_tabs.setStyleSheet(f"""
+            QTabBar::tab {{
+                background-color: {Theme.BG_CARD};
+                color: {Theme.TEXT_MUTED};
+                border: 1px solid {Theme.BORDER};
+                border-radius: 10px;
+                padding: 8px 14px;
+                margin-right: 6px;
+                min-height: 18px;
+                font-weight: 600;
+            }}
+            QTabBar::tab:selected {{
+                background-color: {Theme.PRIMARY_LIGHT};
+                color: {Theme.TEXT_PRIMARY};
+                border-color: {Theme.PRIMARY};
+            }}
+            QTabBar::tab:hover {{
+                color: {Theme.TEXT_PRIMARY};
+                border-color: {Theme.PRIMARY};
+            }}
+        """)
+        self.sheet_tabs.currentChanged.connect(self._on_sheet_changed)
+
+        sheet_tabs_widget = QWidget()
+        sheet_tabs_widget.setFixedHeight(40)
+        sheet_tabs_widget.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        sheet_tabs_layout = QHBoxLayout(sheet_tabs_widget)
+        sheet_tabs_layout.setContentsMargins(0, 0, 0, 0)
+        sheet_tabs_layout.setSpacing(0)
+        sheet_tabs_layout.addWidget(self.sheet_tabs, 0, Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+
+        self.add_sheet_btn = StyledButton("+ Sheet", primary=False)
+        self.add_sheet_btn.setFixedHeight(36)
+        self.add_sheet_btn.setStyleSheet(f"""
+            QPushButton {{
+                background-color: transparent;
+                color: {Theme.TEXT_PRIMARY};
+                border: 1px solid {Theme.BORDER};
+                border-radius: 10px;
+                padding: 0px 14px;
+                font-weight: 600;
+                font-size: 12px;
+            }}
+            QPushButton:hover {{
+                border-color: {Theme.PRIMARY};
+                color: {Theme.PRIMARY};
+            }}
+        """)
+        self.add_sheet_btn.clicked.connect(self._add_sheet)
+        sheet_row.addWidget(self.add_sheet_btn, 0, Qt.AlignmentFlag.AlignRight)
+
+        self.manage_sheets_btn = StyledButton("Manage", primary=False)
+        self.manage_sheets_btn.setFixedHeight(36)
+        self.manage_sheets_btn.setStyleSheet(f"""
+            QPushButton {{
+                background-color: transparent;
+                color: {Theme.TEXT_PRIMARY};
+                border: 1px solid {Theme.BORDER};
+                border-radius: 10px;
+                padding: 0px 14px;
+                font-weight: 600;
+                font-size: 12px;
+            }}
+            QPushButton:hover {{
+                border-color: {Theme.PRIMARY};
+                color: {Theme.PRIMARY};
+            }}
+        """)
+        self.manage_sheets_btn.clicked.connect(self._manage_sheets)
+        sheet_row.addWidget(self.manage_sheets_btn)
+
+        sheet_widget = QWidget()
+        sheet_widget.setLayout(sheet_row)
+        sheet_widget.setFixedHeight(40)
+        sheet_widget.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+
+        sheet_wrapper = QHBoxLayout()
+        sheet_wrapper.setContentsMargins(0, 0, content_margins.right() - 8, 0)
+        sheet_wrapper.setSpacing(0)
+        sheet_wrapper.addStretch()
+        sheet_wrapper.addWidget(sheet_widget, 0, Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignTop)
+
+        sheet_wrapper_widget = QWidget()
+        sheet_wrapper_widget.setLayout(sheet_wrapper)
+
+        top_band = QHBoxLayout()
+        top_band.setContentsMargins(0, 0, 0, 0)
+        top_band.setSpacing(12)
+        top_band.addWidget(sheet_tabs_widget, 1)
+        top_band.addWidget(sheet_wrapper_widget, 0, Qt.AlignmentFlag.AlignRight)
+
+        top_band_widget = QWidget()
+        top_band_widget.setLayout(top_band)
+        content_layout.addWidget(top_band_widget)
+
         # Metrics panel
         metrics_panel = self._create_metrics_panel()
         content_layout.addWidget(metrics_panel)
@@ -3483,6 +3946,7 @@ class MainWindow(QMainWindow):
         main_layout.addWidget(content_container)
         
         central_widget.setLayout(main_layout)
+        self._load_sheet_tabs()
     
     def _create_header(self) -> QWidget:
         """Create the header section."""
@@ -3713,6 +4177,75 @@ class MainWindow(QMainWindow):
         """Update the active search query and refresh the grid."""
         self.search_query = text.strip().lower()
         self._refresh_data()
+
+    def _load_sheet_tabs(self):
+        """Load all sheet tabs from the database."""
+        self.sheets = DatabaseManager.get_sheets()
+        self.sheet_tabs.blockSignals(True)
+        while self.sheet_tabs.count():
+            self.sheet_tabs.removeTab(0)
+
+        for sheet in self.sheets:
+            index = self.sheet_tabs.addTab(sheet.get('name', 'Sheet'))
+            self.sheet_tabs.setTabData(index, sheet.get('id', 1))
+
+        if not self.sheets:
+            self.current_sheet_id = 1
+        else:
+            sheet_ids = [sheet.get('id', 1) for sheet in self.sheets]
+            if self.current_sheet_id not in sheet_ids:
+                self.current_sheet_id = sheet_ids[0]
+            for index in range(self.sheet_tabs.count()):
+                if self.sheet_tabs.tabData(index) == self.current_sheet_id:
+                    self.sheet_tabs.setCurrentIndex(index)
+                    break
+
+        self.sheet_tabs.blockSignals(False)
+        self._refresh_data()
+
+    def _on_sheet_changed(self, index: int):
+        """Switch the active sheet when a tab is selected."""
+        if index < 0:
+            return
+        sheet_id = self.sheet_tabs.tabData(index)
+        if not sheet_id:
+            return
+        if self.current_sheet_id == sheet_id:
+            return
+        self.current_sheet_id = sheet_id
+        self.active_metric_filter = None
+        self._refresh_data()
+
+    def _add_sheet(self):
+        """Create a new sheet/tab for isolated tracking."""
+        name, accepted = QInputDialog.getText(
+            self,
+            "New Sheet",
+            "Enter a name for this sheet:",
+            QLineEdit.EchoMode.Normal
+        )
+        if not accepted:
+            return
+
+        sheet_name = name.strip()
+        if not sheet_name:
+            QMessageBox.warning(self, "Invalid Name", "Please enter a sheet name.")
+            return
+
+        if DatabaseManager.add_sheet(sheet_name) is None:
+            QMessageBox.warning(self, "Duplicate Sheet", "That sheet name already exists or could not be created.")
+            return
+
+        self._load_sheet_tabs()
+        for index in range(self.sheet_tabs.count()):
+            if self.sheet_tabs.tabText(index) == sheet_name:
+                self.sheet_tabs.setCurrentIndex(index)
+                break
+
+    def _manage_sheets(self):
+        """Open the sheet management dialog."""
+        dialog = SheetManagementDialog(self)
+        dialog.exec()
     
     def _create_empty_slot(self) -> QWidget:
         """Create an empty placeholder for a grid slot."""
@@ -3816,13 +4349,13 @@ class MainWindow(QMainWindow):
     
     def _add_equipment(self):
         """Open the add equipment dialog."""
-        dialog = AddEquipmentDialog(parent=self)
+        dialog = AddEquipmentDialog(sheet_id=self.current_sheet_id, parent=self)
         if dialog.exec() == QDialog.DialogCode.Accepted:
             self._refresh_data()
     
     def _edit_equipment(self, machine_data: Dict):
         """Open the edit equipment dialog."""
-        dialog = AddEquipmentDialog(machine_data=machine_data, parent=self)
+        dialog = AddEquipmentDialog(machine_data=machine_data, sheet_id=self.current_sheet_id, parent=self)
         if dialog.exec() == QDialog.DialogCode.Accepted:
             self._refresh_data()
     
@@ -3875,7 +4408,7 @@ class MainWindow(QMainWindow):
     
     def _refresh_data(self):
         """Refresh all data from the database."""
-        machines = DatabaseManager.get_all_machines()
+        machines = DatabaseManager.get_all_machines(self.current_sheet_id)
 
         def _machine_due_sort_key(machine: Dict):
             component_days = [
@@ -4064,7 +4597,7 @@ class MainWindow(QMainWindow):
 
     def _view_maintenance_history(self, machine_data: Dict):
         """Open the maintenance history dialog for a machine."""
-        dialog = MaintenanceHistoryDialog(machine_data, self)
+        dialog = MaintenanceHistoryDialog(machine_data, sheet_id=machine_data.get('sheet_id', self.current_sheet_id), parent=self)
         dialog.exec()
     
     def _show_success_message(self, message: str):
