@@ -1479,6 +1479,27 @@ class StyledProgressBar(QProgressBar):
             }}
         """)
 
+class MetricCard(StyledCard):
+    """Clickable metric card used for dashboard filters."""
+
+    clicked = Signal()
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._active = False
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+
+    def mousePressEvent(self, event):
+        self.clicked.emit()
+        super().mousePressEvent(event)
+
+    def set_active(self, active: bool):
+        self._active = active
+        self.setProperty("active", active)
+        self.style().unpolish(self)
+        self.style().polish(self)
+        self.update()
+
 class ComponentRow(QWidget):
     """Row widget for displaying component status."""
     
@@ -3200,6 +3221,7 @@ class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.email_thread = None
+        self.active_metric_filter = None
         self._setup_ui()
         self._setup_tray()
         self._start_email_thread()
@@ -3504,38 +3526,44 @@ class MainWindow(QMainWindow):
         layout.addWidget(total_card, 0, 0)
         
         # Needs Attention
-        critical_card = self._create_metric_card(
+        self.critical_card = self._create_metric_card(
             "Needs Attention", 
             "0", 
             Theme.RED_LIGHT, 
             Theme.RED,
             "⚠️"
         )
-        self.critical_label = critical_card.findChild(QLabel, "metric_value")
-        layout.addWidget(critical_card, 0, 1)
+        self.critical_label = self.critical_card.findChild(QLabel, "metric_value")
+        self.critical_card.clicked.connect(lambda: self._toggle_metric_filter("critical"))
+        layout.addWidget(self.critical_card, 0, 1)
         
         # Upcoming
-        warning_card = self._create_metric_card(
+        self.warning_card = self._create_metric_card(
             "Upcoming", 
             "0", 
             Theme.YELLOW_LIGHT, 
             Theme.YELLOW,
             "📅"
         )
-        self.warning_label = warning_card.findChild(QLabel, "metric_value")
-        layout.addWidget(warning_card, 0, 2)
+        self.warning_label = self.warning_card.findChild(QLabel, "metric_value")
+        self.warning_card.clicked.connect(lambda: self._toggle_metric_filter("warning"))
+        layout.addWidget(self.warning_card, 0, 2)
         
         panel.setLayout(layout)
         return panel
     
     def _create_metric_card(self, title: str, value: str, bg_color: str, text_color: str, icon: str = "📊") -> QWidget:
         """Create a single metric card."""
-        card = StyledCard()
+        card = MetricCard()
         card.setStyleSheet(f"""
             QFrame {{
                 background-color: {Theme.BG_CARD};
                 border: 1px solid {Theme.BORDER};
                 border-radius: {Theme.CORNER_RADIUS}px;
+            }}
+            QFrame[active="true"] {{
+                border: 2px solid {Theme.PRIMARY};
+                background-color: rgba(59, 130, 246, 0.05);
             }}
         """)
         
@@ -3545,6 +3573,7 @@ class MainWindow(QMainWindow):
         
         # Icon
         icon_label = QLabel(icon)
+        icon_label.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
         icon_label.setStyleSheet(f"""
             QLabel {{
                 background-color: {bg_color};
@@ -3562,10 +3591,12 @@ class MainWindow(QMainWindow):
         text_layout.setSpacing(4)
         
         title_label = QLabel(title)
-        title_label.setStyleSheet(f"QLabel {{ color: {Theme.TEXT_MUTED}; font-size: 14px; border: none; }}")
+        title_label.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+        title_label.setStyleSheet(f"QLabel {{ color: {Theme.TEXT_MUTED}; font-size: 14px; border: none; background-color: transparent; }}")
         text_layout.addWidget(title_label)
-        
+
         value_label = QLabel(value)
+        value_label.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
         value_label.setObjectName("metric_value")
         value_label.setStyleSheet(f"""
             QLabel {{
@@ -3573,6 +3604,7 @@ class MainWindow(QMainWindow):
                 font-weight: 700;
                 color: {text_color};
                 border: none;
+                background-color: transparent;
             }}
         """)
         text_layout.addWidget(value_label)
@@ -3582,6 +3614,15 @@ class MainWindow(QMainWindow):
         
         card.setLayout(layout)
         return card
+
+    def _toggle_metric_filter(self, filter_name: str):
+        """Toggle a metric filter and refresh the grid."""
+        if self.active_metric_filter == filter_name:
+            self.active_metric_filter = None
+        else:
+            self.active_metric_filter = filter_name
+
+        self._refresh_data()
     
     def _create_empty_slot(self) -> QWidget:
         """Create an empty placeholder for a grid slot."""
@@ -3745,6 +3786,33 @@ class MainWindow(QMainWindow):
     def _refresh_data(self):
         """Refresh all data from the database."""
         machines = DatabaseManager.get_all_machines()
+
+        def _machine_due_sort_key(machine: Dict):
+            component_days = [
+                component.get('days_remaining', 0)
+                for component in machine.get('components', [])
+            ]
+            # Machines with no components should drift to the bottom.
+            soonest_due = min(component_days) if component_days else 10**9
+            return (soonest_due, machine.get('name', '').lower())
+
+        machines = sorted(machines, key=_machine_due_sort_key)
+
+        def _machine_matches_filter(machine: Dict) -> bool:
+            if not self.active_metric_filter:
+                return True
+
+            for component in machine.get('components', []):
+                days = component.get('days_remaining', 0)
+                alert_threshold = component.get('alert_threshold_days', 5)
+
+                if self.active_metric_filter == "critical" and days <= 0:
+                    return True
+                if self.active_metric_filter == "warning" and 0 < days <= alert_threshold:
+                    return True
+            return False
+
+        filtered_machines = [machine for machine in machines if _machine_matches_filter(machine)]
         
         # Clear all existing widgets from the layout using reversed loop
         for i in range(self.cards_layout.count() - 1, -1, -1):
@@ -3763,7 +3831,7 @@ class MainWindow(QMainWindow):
         warning_count = 0
         
         # Add cards for each machine with dynamic row calculation
-        for i, machine in enumerate(machines):
+        for i, machine in enumerate(filtered_machines):
             card = EquipmentCard(machine)
             card.reset_component.connect(self._reset_component)
             card.edit_requested.connect(self._edit_equipment)
@@ -3790,14 +3858,14 @@ class MainWindow(QMainWindow):
         
         # Add placeholder slots for empty positions (minimum 6 slots to show grid when empty)
         min_slots = 6  # Show at least a 2x3 grid when empty
-        start_slot = len(machines)
+        start_slot = len(filtered_machines)
         
         # Calculate how many placeholders we need
         # If we have equipment, fill the current row AND add one more full row
         # If no equipment, show minimum grid
-        if machines:
+        if filtered_machines:
             # Complete the current row
-            current_row_items = len(machines) % self.current_columns
+            current_row_items = len(filtered_machines) % self.current_columns
             if current_row_items == 0:
                 # Row is already full, add one more full row
                 placeholders_needed = self.current_columns
@@ -3819,6 +3887,11 @@ class MainWindow(QMainWindow):
         self.total_equipment_label.setText(str(total_equipment))
         self.critical_label.setText(str(critical_count))
         self.warning_label.setText(str(warning_count))
+
+        if hasattr(self, "critical_card"):
+            self.critical_card.set_active(self.active_metric_filter == "critical")
+        if hasattr(self, "warning_card"):
+            self.warning_card.set_active(self.active_metric_filter == "warning")
         
         # Force UI update
         QApplication.processEvents()
