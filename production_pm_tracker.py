@@ -3222,6 +3222,7 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.email_thread = None
         self.active_metric_filter = None
+        self.search_query = ""
         self._setup_ui()
         self._setup_tray()
         self._start_email_thread()
@@ -3309,10 +3310,73 @@ class MainWindow(QMainWindow):
         content_layout = QVBoxLayout()
         content_layout.setContentsMargins(24, 24, 24, 24)
         content_layout.setSpacing(24)
+        content_margins = content_layout.contentsMargins()
         
         # Metrics panel
         metrics_panel = self._create_metrics_panel()
         content_layout.addWidget(metrics_panel)
+
+        # Search bar
+        search_row = QHBoxLayout()
+        search_row.setContentsMargins(0, 0, 0, 0)
+        search_row.setSpacing(8)
+
+        search_label = QLabel("Search")
+        search_label.setStyleSheet(f"QLabel {{ color: {Theme.TEXT_PRIMARY}; font-weight: 600; border: none; font-size: 12px; }}")
+        search_row.addWidget(search_label)
+
+        self.search_input = StyledLineEdit("Search equipment, components, location, serial number")
+        self.search_input.setMinimumHeight(34)
+        self.search_input.setStyleSheet(f"""
+            QLineEdit {{
+                background-color: {Theme.BG_INPUT};
+                color: {Theme.TEXT_PRIMARY};
+                border: 1px solid {Theme.BORDER};
+                border-radius: 10px;
+                padding: 6px 10px;
+                font-size: 13px;
+            }}
+            QLineEdit:focus {{
+                border-color: {Theme.BORDER_FOCUS};
+            }}
+        """)
+        self.search_input.textChanged.connect(self._on_search_changed)
+        search_row.addWidget(self.search_input, 1)
+
+        clear_search_btn = StyledButton("Clear", primary=False)
+        clear_search_btn.setFixedHeight(34)
+        clear_search_btn.setStyleSheet(f"""
+            QPushButton {{
+                background-color: transparent;
+                color: {Theme.TEXT_PRIMARY};
+                border: 1px solid {Theme.BORDER};
+                border-radius: 10px;
+                padding: 0px 14px;
+                font-weight: 600;
+                font-size: 12px;
+            }}
+            QPushButton:hover {{
+                border-color: {Theme.PRIMARY};
+                color: {Theme.PRIMARY};
+            }}
+        """)
+        clear_search_btn.clicked.connect(lambda: self.search_input.setText(""))
+        search_row.addWidget(clear_search_btn)
+
+        search_widget = QWidget()
+        search_widget.setLayout(search_row)
+        search_widget.setFixedHeight(40)
+        search_widget.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+
+        search_wrapper = QHBoxLayout()
+        search_wrapper.setContentsMargins(0, 0, content_margins.right() - 8, 0)
+        search_wrapper.setSpacing(0)
+        search_wrapper.addStretch()
+        search_wrapper.addWidget(search_widget, 0, Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignTop)
+
+        search_wrapper_widget = QWidget()
+        search_wrapper_widget.setLayout(search_wrapper)
+        content_layout.addWidget(search_wrapper_widget)
         
         # Equipment cards container
         self.scroll_area = QScrollArea()
@@ -3623,6 +3687,11 @@ class MainWindow(QMainWindow):
             self.active_metric_filter = filter_name
 
         self._refresh_data()
+
+    def _on_search_changed(self, text: str):
+        """Update the active search query and refresh the grid."""
+        self.search_query = text.strip().lower()
+        self._refresh_data()
     
     def _create_empty_slot(self) -> QWidget:
         """Create an empty placeholder for a grid slot."""
@@ -3800,17 +3869,39 @@ class MainWindow(QMainWindow):
 
         def _machine_matches_filter(machine: Dict) -> bool:
             if not self.active_metric_filter:
+                metric_match = True
+            else:
+                metric_match = False
+
+                for component in machine.get('components', []):
+                    days = component.get('days_remaining', 0)
+                    alert_threshold = component.get('alert_threshold_days', 5)
+
+                    if self.active_metric_filter == "critical" and days <= 0:
+                        metric_match = True
+                        break
+                    if self.active_metric_filter == "warning" and 0 < days <= alert_threshold:
+                        metric_match = True
+                        break
+
+            if not metric_match:
+                return False
+
+            if not self.search_query:
                 return True
 
-            for component in machine.get('components', []):
-                days = component.get('days_remaining', 0)
-                alert_threshold = component.get('alert_threshold_days', 5)
-
-                if self.active_metric_filter == "critical" and days <= 0:
-                    return True
-                if self.active_metric_filter == "warning" and 0 < days <= alert_threshold:
-                    return True
-            return False
+            search_terms = [self.search_query]
+            machine_text = " ".join([
+                machine.get('name', ''),
+                machine.get('serial_number') or '',
+                machine.get('location') or '',
+                " ".join(
+                    component.get('component_name', '')
+                    for component in machine.get('components', [])
+                    if component.get('component_name')
+                ),
+            ]).lower()
+            return any(term in machine_text for term in search_terms)
 
         filtered_machines = [machine for machine in machines if _machine_matches_filter(machine)]
         
@@ -3826,7 +3917,7 @@ class MainWindow(QMainWindow):
         QApplication.processEvents()
         
         # Update metrics
-        total_equipment = len(machines)
+        total_equipment = len(filtered_machines)
         critical_count = 0
         warning_count = 0
         
