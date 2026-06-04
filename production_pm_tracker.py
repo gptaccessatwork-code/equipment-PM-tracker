@@ -85,30 +85,46 @@ class NoWheelDateEdit(QDateEdit):
     def wheelEvent(self, event):
         event.ignore()
 
+
+DISPLAY_DATE_FORMAT = "%d %b %Y"
+
+
+def format_date_for_display(value: Optional[str]) -> str:
+    """Format stored ISO dates for UI display."""
+    if not value:
+        return ""
+    try:
+        return date.fromisoformat(value).strftime(DISPLAY_DATE_FORMAT)
+    except ValueError:
+        try:
+            return datetime.fromisoformat(value).strftime(DISPLAY_DATE_FORMAT)
+        except Exception:
+            return str(value)
+
 # ══════════════════════════════════════════════════════════════════════════════
 #  DATABASE SETUP
 # ══════════════════════════════════════════════════════════════════════════════
-def get_base_path():
-    """Get the base directory for database and config files."""
+def get_base_path() -> str:
+    """Return the base directory for database and config files."""
     if getattr(sys, 'frozen', False):
         return os.path.dirname(sys.executable)
     return os.path.dirname(os.path.abspath(__file__))
 
-def get_db_path():
-    """Get the database file path."""
+def get_db_path() -> str:
+    """Return the database file path."""
     return os.path.join(get_base_path(), "production_pm_tracker.db")
 
-def get_db_connection():
+def get_db_connection() -> sqlite3.Connection:
     """Open a SQLite connection with foreign keys enabled."""
     conn = sqlite3.connect(get_db_path())
     conn.execute("PRAGMA foreign_keys = ON")
     return conn
 
-def get_email_config_path():
-    """Get the email config file path."""
+def get_email_config_path() -> str:
+    """Return the email config file path."""
     return os.path.join(get_base_path(), "email_config.json")
 
-def init_database():
+def init_database() -> None:
     """Initialize the SQLite database with the required schema."""
     with get_db_connection() as conn:
         cursor = conn.cursor()
@@ -671,6 +687,19 @@ class DatabaseManager:
             return False
 
     @staticmethod
+    def _get_latest_maintenance_log_id(cursor, component_id: int) -> Optional[int]:
+        """Return the newest maintenance log id for a component."""
+        cursor.execute("""
+            SELECT id
+            FROM maintenance_log
+            WHERE component_id = ?
+            ORDER BY maintenance_date DESC, recorded_at DESC, id DESC
+            LIMIT 1
+        """, (component_id,))
+        row = cursor.fetchone()
+        return row["id"] if row else None
+
+    @staticmethod
     def update_component(component_id: int, machine_id: int, machine_name: str, component_data: Dict) -> bool:
         """Update an existing component in place."""
         try:
@@ -950,9 +979,11 @@ class DatabaseManager:
                     notes,
                     log_id
                 ))
-                if not DatabaseManager._apply_component_schedule_state(cursor, component_id):
-                    conn.rollback()
-                    return False
+                latest_log_id = DatabaseManager._get_latest_maintenance_log_id(cursor, component_id)
+                if latest_log_id == log_id:
+                    if not DatabaseManager._apply_component_schedule_state(cursor, component_id):
+                        conn.rollback()
+                        return False
                 conn.commit()
                 return True
         except Exception as e:
@@ -979,9 +1010,20 @@ class DatabaseManager:
                 cursor.execute("DELETE FROM maintenance_log WHERE id = ? AND sheet_id = ?", (log_id, sheet_id))
                 if cursor.rowcount <= 0:
                     return False
-                if not DatabaseManager._apply_component_schedule_state(cursor, component_id):
-                    conn.rollback()
-                    return False
+                latest_log_id = DatabaseManager._get_latest_maintenance_log_id(cursor, component_id)
+                if latest_log_id is not None:
+                    if not DatabaseManager._apply_component_schedule_state(cursor, component_id):
+                        conn.rollback()
+                        return False
+                else:
+                    cursor.execute("""
+                        UPDATE components
+                        SET last_performed_date = NULL,
+                            next_due_date = NULL,
+                            custom_start_date = NULL,
+                            custom_start_applied_date = NULL
+                        WHERE id = ?
+                    """, (component_id,))
                 conn.commit()
                 return True
         except Exception as e:
@@ -1326,7 +1368,7 @@ class EmailConfig:
         """Build INFICON-style grouped HTML email content."""
         today_str = datetime.now().strftime("%d %b %Y")
         total = len(components)
-        subject = f"[PM Tracker] {sheet_name}: Maintenance Due Within 30 Days — {today_str}"
+        subject = f"[PM Tracker] {sheet_name}: Maintenance Alert Period Reached — {today_str}"
         
         def _status_label(days):
             if days <= 0: return "#fca5a5", "OVERDUE"
@@ -1377,7 +1419,7 @@ class EmailConfig:
             overdue_count = sum(1 for x in machine_components if x['days_remaining'] <= 0)
             intro = (
                 f"The following {len(machine_components)} component(s) for "
-                f"<strong>{machine_title}</strong> are due within 30 days or are already overdue."
+                f"<strong>{machine_title}</strong> have reached their alert period or are already overdue."
             )
             if overdue_count:
                 intro += f" <strong style='color:#fca5a5;'>{overdue_count} component(s) are already overdue.</strong>"
@@ -1471,29 +1513,42 @@ class EmailNotificationThread(threading.Thread):
     """Background thread for email notifications."""
     
     CHECK_INTERVAL = 3600  # 1 hour
+    POLL_INTERVAL = 2.0
     
     def __init__(self):
         super().__init__(daemon=True)
         self._stop_event = threading.Event()
         self._callback = None  # Callback to update UI
     
-    def set_callback(self, callback):
+    def set_callback(self, callback) -> None:
         """Set callback for UI updates."""
         self._callback = callback
     
-    def stop(self):
-        """Stop the notification thread."""
+    def stop(self) -> None:
+        """Request that the notification thread stop."""
         self._stop_event.set()
+
+    def _wait_with_stop(self, timeout_seconds: float) -> bool:
+        """Sleep in small increments so shutdown remains responsive."""
+        deadline = time.monotonic() + max(timeout_seconds, 0.0)
+        while not self._stop_event.is_set():
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            self._stop_event.wait(min(self.POLL_INTERVAL, remaining))
+        return self._stop_event.is_set()
     
-    def run(self):
+    def run(self) -> None:
         """Run the notification loop."""
-        time.sleep(15)  # Initial delay
-        
+        if self._wait_with_stop(15):
+            return
+
         while not self._stop_event.is_set():
             self._check_notifications()
-            self._stop_event.wait(self.CHECK_INTERVAL)
+            if self._wait_with_stop(self.CHECK_INTERVAL):
+                break
     
-    def _check_notifications(self):
+    def _check_notifications(self) -> None:
         """Check for components due soon and send emails."""
         config = EmailConfig.load_config()
         
@@ -1532,7 +1587,7 @@ class EmailNotificationThread(threading.Thread):
                 DatabaseManager.mark_email_sent(
                     today,
                     len(due_components),
-                    ", ".join(config.get('to_addrs', [])),
+                    ", ".join(sheet_recipients),
                     sheet_id
                 )
                 sent_count += 1
@@ -1963,6 +2018,8 @@ class RecordMaintenanceDialog(QDialog):
 
         self.date_input = NoWheelDateEdit()
         self.date_input.setCalendarPopup(True)
+        self.date_input.setDisplayFormat("dd MMM yyyy")
+        self.date_input.setMinimumWidth(150)
         if self._initial_maintenance_date:
             try:
                 self.date_input.setDate(date.fromisoformat(self._initial_maintenance_date))
@@ -1978,6 +2035,7 @@ class RecordMaintenanceDialog(QDialog):
                 border: 1px solid {Theme.BORDER};
                 border-radius: 6px;
                 padding: 8px;
+                min-width: 150px;
             }}
             QDateEdit:focus {{
                 border: 1px solid {Theme.BORDER_FOCUS};
@@ -2203,6 +2261,7 @@ class MaintenanceHistoryDialog(QDialog):
         header.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
         header.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
         header.setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
+        header.setMinimumSectionSize(120)
         layout.addWidget(self.table, 1)
 
         action_layout = QHBoxLayout()
@@ -2271,7 +2330,7 @@ class MaintenanceHistoryDialog(QDialog):
         self.table.setRowCount(len(logs))
         for row_index, entry in enumerate(logs):
             values = [
-                entry.get('maintenance_date', ''),
+                format_date_for_display(entry.get('maintenance_date', '')),
                 entry.get('component_name', ''),
                 entry.get('notes') or ''
             ]
@@ -2333,7 +2392,7 @@ class MaintenanceHistoryDialog(QDialog):
         msg_box.setWindowTitle("Delete Log Entry")
         msg_box.setText(
             f"Delete the maintenance entry for {log.get('component_name', 'this component')} "
-            f"on {log.get('maintenance_date', '')}?"
+            f"on {format_date_for_display(log.get('maintenance_date', ''))}?"
         )
         msg_box.setStandardButtons(QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
         msg_box.setStyleSheet(f"""
@@ -2997,6 +3056,8 @@ class ComponentInputWidget(QWidget):
         self.custom_start_date = NoWheelDateEdit()
         self.custom_start_date.setDate(date.today())
         self.custom_start_date.setCalendarPopup(True)
+        self.custom_start_date.setDisplayFormat("dd MMM yyyy")
+        self.custom_start_date.setMinimumWidth(150)
         self.custom_start_date.setVisible(False)
         self.custom_start_date.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         self.custom_start_date.setStyleSheet(f"""
@@ -3006,6 +3067,7 @@ class ComponentInputWidget(QWidget):
                 border: 1px solid {Theme.BORDER};
                 border-radius: 6px;
                 padding: 8px;
+                min-width: 150px;
             }}
             QDateEdit:focus {{
                 border: 1px solid {Theme.BORDER_FOCUS};
@@ -3838,14 +3900,7 @@ class MainWindow(QMainWindow):
     
     def _force_layout_update(self):
         """Force layout update based on current window size."""
-        window_width = self.width()
-        
-        # Determine column count based on window width (infinite rows)
-        if window_width >= self.WIDTH_THRESHOLD:
-            self.current_columns = 3
-        else:
-            self.current_columns = 2
-        
+        self._update_grid_geometry()
         self._refresh_data()
     
     def _setup_ui(self):
@@ -4109,7 +4164,7 @@ class MainWindow(QMainWindow):
         # Equipment cards container
         self.scroll_area = QScrollArea()
         self.scroll_area.setWidgetResizable(True)
-        self.scroll_area.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOn)
+        self.scroll_area.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
         self.scroll_area.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self.scroll_area.setStyleSheet(f"""
             QScrollArea {{
@@ -4168,7 +4223,8 @@ class MainWindow(QMainWindow):
         
         # Responsive grid configuration (infinite rows, responsive columns)
         self.WIDTH_THRESHOLD = 1200  # Threshold for switching between 2 and 3 columns
-        self.current_columns = 3  # Start with maximized layout
+        self.target_columns = 3  # Start with maximized layout
+        self.current_columns = 3
         self.previous_columns = 3
         
         # Placeholders are handled dynamically in _refresh_data()
@@ -4530,6 +4586,31 @@ class MainWindow(QMainWindow):
 
         self._load_sheet_tabs()
 
+    def _update_grid_geometry(self) -> int:
+        """Update the card grid column count from the current window geometry."""
+        viewport_width = 0
+        if hasattr(self, "scroll_area") and self.scroll_area is not None:
+            viewport = self.scroll_area.viewport()
+            if viewport is not None:
+                viewport_width = viewport.width()
+
+        available_width = max(viewport_width, self.width())
+        target_columns = 3 if available_width >= self.WIDTH_THRESHOLD else 2
+        self.target_columns = target_columns
+        self.current_columns = target_columns
+        return target_columns
+
+    def _clear_cards_layout(self) -> None:
+        """Remove all equipment cards and release their widgets."""
+        while self.cards_layout.count():
+            item = self.cards_layout.takeAt(0)
+            if not item:
+                continue
+            widget = item.widget()
+            if widget is not None:
+                widget.setParent(None)
+                widget.deleteLater()
+
     def _delete_sheet_by_id(self, sheet_id: int, sheet_name: str):
         """Delete a sheet using its id."""
         if sheet_id == 1:
@@ -4601,24 +4682,10 @@ class MainWindow(QMainWindow):
 
         try:
             machines = DatabaseManager.get_all_machines(self.current_sheet_id)
-            components = []
-            for machine in machines:
-                for component in machine.get("components", []):
-                    comp = dict(component)
-                    comp["machine_name"] = machine.get("name", "")
-                    comp["machine_serial_number"] = machine.get("serial_number", "")
-                    comp["machine_location"] = machine.get("location", "")
-                    components.append(comp)
-
             logs = DatabaseManager.get_maintenance_history(sheet_id=self.current_sheet_id)
-            due_components = DatabaseManager.get_components_due_soon(self.current_sheet_id)
 
             wb = Workbook()
-            ws_overview = wb.active
-            ws_overview.title = "Overview"
-            ws_equipment = wb.create_sheet("Equipment")
-            ws_components = wb.create_sheet("Components")
-            ws_logs = wb.create_sheet("Logs")
+            wb.remove(wb.active)
 
             title_fill = PatternFill("solid", fgColor="1E293B")
             header_fill = PatternFill("solid", fgColor="3B82F6")
@@ -4639,8 +4706,20 @@ class MainWindow(QMainWindow):
                 bottom=Side(style="thin", color="E2E8F0"),
             )
 
-            def style_title(ws, title_text):
-                ws.merge_cells("A1:F1")
+            def unique_sheet_name(base_name: str, existing: set[str]) -> str:
+                cleaned = "".join(ch if ch.isalnum() or ch in (" ", "_", "-") else "_" for ch in base_name).strip() or "Equipment"
+                cleaned = cleaned[:31]
+                candidate = cleaned
+                counter = 2
+                while candidate in existing or not candidate:
+                    suffix = f"_{counter}"
+                    candidate = f"{cleaned[:31 - len(suffix)]}{suffix}"
+                    counter += 1
+                existing.add(candidate)
+                return candidate
+
+            def style_sheet_title(ws, title_text, subtitle_text=""):
+                ws.merge_cells("A1:H1")
                 cell = ws["A1"]
                 cell.value = title_text
                 cell.fill = title_fill
@@ -4648,18 +4727,26 @@ class MainWindow(QMainWindow):
                 cell.alignment = Alignment(horizontal="left", vertical="center")
                 ws.row_dimensions[1].height = 24
 
-            def style_meta_rows(ws, rows):
+                if subtitle_text:
+                    ws.merge_cells("A2:H2")
+                    sub = ws["A2"]
+                    sub.value = subtitle_text
+                    sub.font = Font(color="94A3B8", italic=True, size=10)
+                    sub.alignment = Alignment(horizontal="left", vertical="center")
+
+            def write_info_block(ws, rows, start_row=4):
                 for row_idx, label, value in rows:
                     ws[f"A{row_idx}"] = label
                     ws[f"A{row_idx}"].font = Font(bold=True, color="334155")
+                    ws[f"A{row_idx}"].fill = subheader_fill
+                    ws[f"A{row_idx}"].border = thin_border
+                    ws[f"A{row_idx}"].alignment = Alignment(horizontal="left", vertical="center")
+
                     ws[f"B{row_idx}"] = value
                     ws[f"B{row_idx}"].font = Font(color="0F172A")
-                    ws[f"A{row_idx}"].fill = subheader_fill
                     ws[f"B{row_idx}"].fill = PatternFill("solid", fgColor="FFFFFF")
-                    ws[f"A{row_idx}"].border = thin_border
                     ws[f"B{row_idx}"].border = thin_border
-                    ws[f"A{row_idx}"].alignment = Alignment(horizontal="left", vertical="center")
-                    ws[f"B{row_idx}"].alignment = Alignment(horizontal="left", vertical="center")
+                    ws[f"B{row_idx}"].alignment = Alignment(horizontal="left", vertical="center", wrap_text=True)
 
             def format_table(ws, headers, rows, start_row=1, freeze_row=None):
                 for col_idx, header in enumerate(headers, 1):
@@ -4690,122 +4777,121 @@ class MainWindow(QMainWindow):
                 for col_letter, width in widths.items():
                     ws.column_dimensions[col_letter].width = width
 
-            # Overview
-            style_title(ws_overview, f"Equipment PM Export - {sheet_name}")
-            overview_rows = [
-                (3, "Sheet Name", sheet_name),
-                (4, "Exported On", datetime.now().strftime("%Y-%m-%d %H:%M:%S")),
-                (5, "Equipment Count", len(machines)),
-                (6, "Component Count", len(components)),
-                (7, "Due Soon / Overdue", len(due_components)),
-                (8, "Maintenance Logs", len(logs)),
-            ]
-            style_meta_rows(ws_overview, overview_rows)
-            ws_overview["A10"] = "Quick Summary"
-            ws_overview["A10"].font = Font(bold=True, color="FFFFFF")
-            ws_overview["A10"].fill = header_fill
-            ws_overview["A10"].alignment = Alignment(horizontal="left")
-            ws_overview.merge_cells("A10:B10")
-            ws_overview["A11"] = (
-                "The workbook includes an equipment summary, a detailed component list, "
-                "and the maintenance log history for this sheet."
-            )
-            ws_overview["A11"].alignment = Alignment(wrap_text=True, vertical="top")
-            ws_overview["A11"].border = thin_border
-            ws_overview.merge_cells("A11:F13")
-            ws_overview.row_dimensions[11].height = 42
-            set_widths(ws_overview, {"A": 22, "B": 40, "C": 16, "D": 16, "E": 16, "F": 16})
-
-            # Equipment
-            equipment_rows = []
+            exported_machines = 0
+            existing_names: set[str] = set()
             for machine in machines:
+                exported_machines += 1
                 machine_components = machine.get("components", [])
+                machine_logs = [log for log in logs if log.get("machine_id") == machine.get("id")]
                 soonest = min((c.get("days_remaining", 0) for c in machine_components), default=None)
-                status = "No components"
+                current_status = "No Components"
                 if machine_components:
                     if any(c.get("days_remaining", 0) <= 0 for c in machine_components):
-                        status = "Attention"
+                        current_status = "Needs Attention"
                     elif any(0 < c.get("days_remaining", 0) <= c.get("alert_threshold_days", 5) for c in machine_components):
-                        status = "Upcoming"
+                        current_status = "Upcoming"
                     else:
-                        status = "Healthy"
+                        current_status = "Healthy"
 
-                component_lines = []
+                ws = wb.create_sheet(unique_sheet_name(machine.get("name", "Equipment"), existing_names))
+                style_sheet_title(
+                    ws,
+                    machine.get("name", "Equipment"),
+                    f"Sheet: {sheet_name}    Exported: {datetime.now().strftime('%d %b %Y')}"
+                )
+
+                info_rows = [
+                    (4, "Serial Number", machine.get("serial_number") or "N/A"),
+                    (5, "Location", machine.get("location") or "N/A"),
+                    (6, "Status", current_status),
+                    (7, "Components", str(len(machine_components))),
+                    (8, "Soonest Due", format_date_for_display((min((c.get('next_due_date') for c in machine_components if c.get('next_due_date')), default=None))) if machine_components else "N/A"),
+                ]
+                write_info_block(ws, info_rows)
+
+                component_start = 10
+                ws.merge_cells(start_row=component_start, start_column=1, end_row=component_start, end_column=8)
+                comp_title = ws.cell(component_start, 1, "Current Components")
+                comp_title.fill = header_fill
+                comp_title.font = white_font
+                comp_title.alignment = Alignment(horizontal="left", vertical="center")
+
+                component_rows = []
                 for comp in machine_components:
-                    component_lines.append(
-                        f"{comp.get('component_name', 'Component')} - {comp.get('days_remaining', 0)}d left"
-                    )
+                    component_rows.append([
+                        comp.get("component_name", ""),
+                        comp.get("pm_interval_days", ""),
+                        comp.get("alert_threshold_days", ""),
+                        format_date_for_display(comp.get("last_performed_date")),
+                        format_date_for_display(comp.get("next_due_date")),
+                        comp.get("days_remaining", ""),
+                        format_date_for_display(comp.get("custom_start_date")),
+                        "Attention" if comp.get("days_remaining", 0) <= 0 else (
+                            "Upcoming" if 0 < comp.get("days_remaining", 0) <= comp.get("alert_threshold_days", 5) else "Healthy"
+                        ),
+                    ])
 
-                equipment_rows.append([
-                    machine.get("name", ""),
-                    machine.get("serial_number", ""),
-                    machine.get("location", ""),
-                    "\n".join(component_lines) if component_lines else "No components",
-                    soonest if soonest is not None else "",
-                    status,
-                ])
+                format_table(
+                    ws,
+                    [
+                        "Component", "Interval (Days)", "Alert (Days)", "Last Performed",
+                        "Next Due", "Days Left", "Custom Start", "Status"
+                    ],
+                    component_rows,
+                    start_row=component_start + 1,
+                    freeze_row=f"A{component_start + 2}"
+                )
+                set_widths(ws, {
+                    "A": 26, "B": 14, "C": 12, "D": 16, "E": 16, "F": 12, "G": 16, "H": 14
+                })
 
-            format_table(
-                ws_equipment,
-                ["Equipment", "Serial Number", "Location", "Components", "Soonest Due", "Status"],
-                equipment_rows,
-                start_row=1,
-                freeze_row="A2"
-            )
-            set_widths(ws_equipment, {"A": 26, "B": 18, "C": 18, "D": 48, "E": 14, "F": 16})
+                history_start = component_start + max(len(component_rows), 1) + 4
+                ws.merge_cells(start_row=history_start, start_column=1, end_row=history_start, end_column=5)
+                hist_title = ws.cell(history_start, 1, "Maintenance History")
+                hist_title.fill = header_fill
+                hist_title.font = white_font
+                hist_title.alignment = Alignment(horizontal="left", vertical="center")
 
-            # Components
-            component_rows = []
-            for comp in components:
-                component_rows.append([
-                    comp.get("machine_name", ""),
-                    comp.get("machine_serial_number", ""),
-                    comp.get("machine_location", ""),
-                    comp.get("component_name", ""),
-                    comp.get("pm_interval_days", ""),
-                    comp.get("alert_threshold_days", ""),
-                    comp.get("last_performed_date") or "",
-                    comp.get("next_due_date") or "",
-                    comp.get("days_remaining", ""),
-                    comp.get("custom_start_date") or "",
-                ])
+                history_rows = []
+                for log in machine_logs:
+                    history_rows.append([
+                        format_date_for_display(log.get("maintenance_date")),
+                        log.get("component_name", ""),
+                        log.get("notes") or "",
+                    ])
 
-            format_table(
-                ws_components,
-                [
-                    "Equipment", "Serial Number", "Location", "Component", "Interval (Days)",
-                    "Alert (Days)", "Last Performed", "Next Due", "Days Left", "Custom Start"
-                ],
-                component_rows,
-                start_row=1,
-                freeze_row="A2"
-            )
-            set_widths(ws_components, {
-                "A": 24, "B": 16, "C": 18, "D": 22, "E": 14,
-                "F": 12, "G": 14, "H": 14, "I": 12, "J": 14
-            })
+                format_table(
+                    ws,
+                    ["Date", "Component", "Notes"],
+                    history_rows,
+                    start_row=history_start + 1,
+                    freeze_row=f"A{history_start + 2}"
+                )
+                ws.column_dimensions["A"].width = 18
+                ws.column_dimensions["B"].width = 26
+                ws.column_dimensions["C"].width = 16
+                ws.column_dimensions["D"].width = 16
+                ws.column_dimensions["E"].width = 16
+                ws.column_dimensions["F"].width = 12
+                ws.column_dimensions["G"].width = 16
+                ws.column_dimensions["H"].width = 14
+                ws.column_dimensions["I"].width = 14
+                ws.column_dimensions["J"].width = 14
+                ws.column_dimensions["C"].width = 52
+                for row in ws.iter_rows():
+                    for cell in row:
+                        if cell.column in (1, 2, 4, 5, 6, 7, 8):
+                            cell.alignment = Alignment(horizontal="center", vertical="top", wrap_text=True)
 
-            # Logs
-            log_rows = []
-            for log in logs:
-                log_rows.append([
-                    log.get("maintenance_date", ""),
-                    log.get("machine_name", ""),
-                    log.get("machine_serial_number", ""),
-                    log.get("component_name", ""),
-                    log.get("notes") or "",
-                ])
+                ws.sheet_view.showGridLines = False
 
-            format_table(
-                ws_logs,
-                ["Date", "Equipment", "Serial Number", "Component", "Notes"],
-                log_rows,
-                start_row=1,
-                freeze_row="A2"
-            )
-            set_widths(ws_logs, {"A": 14, "B": 24, "C": 16, "D": 22, "E": 52})
-
-            for ws in (ws_overview, ws_equipment, ws_components, ws_logs):
+            if exported_machines == 0:
+                ws = wb.create_sheet(unique_sheet_name("No Equipment", existing_names))
+                style_sheet_title(ws, "No Equipment Found", f"Sheet: {sheet_name}")
+                ws["A4"] = "There is no equipment on this sheet to export yet."
+                ws["A4"].font = Font(color="0F172A", bold=True)
+                ws["A4"].alignment = Alignment(wrap_text=True)
+                ws.column_dimensions["A"].width = 58
                 ws.sheet_view.showGridLines = False
 
             wb.save(file_path)
@@ -4971,6 +5057,7 @@ class MainWindow(QMainWindow):
     
     def _refresh_data(self):
         """Refresh all data from the database."""
+        self._update_grid_geometry()
         machines = DatabaseManager.get_all_machines(self.current_sheet_id)
 
         def _machine_due_sort_key(machine: Dict):
@@ -5022,16 +5109,7 @@ class MainWindow(QMainWindow):
 
         filtered_machines = [machine for machine in machines if _machine_matches_filter(machine)]
         
-        # Clear all existing widgets from the layout using reversed loop
-        for i in range(self.cards_layout.count() - 1, -1, -1):
-            item = self.cards_layout.itemAt(i)
-            if item:
-                widget = item.widget()
-                if widget:
-                    widget.deleteLater()
-        
-        # Process events to ensure widgets are deleted before adding new ones
-        QApplication.processEvents()
+        self._clear_cards_layout()
         
         # Update metrics
         total_equipment = len(filtered_machines)
@@ -5058,8 +5136,8 @@ class MainWindow(QMainWindow):
                     warning_count += 1
             
             # Dynamic row calculation for infinite scrolling
-            row = i // self.current_columns
-            col = i % self.current_columns
+            row = i // self.target_columns
+            col = i % self.target_columns
             
             # Add the card to the grid
             self.cards_layout.addWidget(card, row, col)
@@ -5073,13 +5151,13 @@ class MainWindow(QMainWindow):
         # If no equipment, show minimum grid
         if filtered_machines:
             # Complete the current row
-            current_row_items = len(filtered_machines) % self.current_columns
+            current_row_items = len(filtered_machines) % self.target_columns
             if current_row_items == 0:
                 # Row is already full, add one more full row
-                placeholders_needed = self.current_columns
+                placeholders_needed = self.target_columns
             else:
                 # Fill current row and add one more full row
-                placeholders_needed = (self.current_columns - current_row_items) + self.current_columns
+                placeholders_needed = (self.target_columns - current_row_items) + self.target_columns
         else:
             # Show minimum grid when empty
             placeholders_needed = min_slots
@@ -5087,8 +5165,8 @@ class MainWindow(QMainWindow):
         for i in range(placeholders_needed):
             placeholder = self._create_empty_slot()
             slot_index = start_slot + i
-            row = slot_index // self.current_columns
-            col = slot_index % self.current_columns
+            row = slot_index // self.target_columns
+            col = slot_index % self.target_columns
             self.cards_layout.addWidget(placeholder, row, col)
         
         # Update metric labels
@@ -5118,17 +5196,11 @@ class MainWindow(QMainWindow):
         
         super().resizeEvent(event)
         
-        window_width = self.width()
-        
-        # Determine column count based on window width (infinite rows)
-        if window_width >= self.WIDTH_THRESHOLD:
-            target_columns = 3
-        else:
-            target_columns = 2
-        
+        target_columns = self._update_grid_geometry()
+
         # Only refresh if column count changed
-        if target_columns != self.current_columns:
-            self.current_columns = target_columns
+        if target_columns != self.previous_columns:
+            self.previous_columns = target_columns
             self._refresh_data()
         
         event.accept()
@@ -5139,6 +5211,8 @@ class MainWindow(QMainWindow):
             # If window is restored from minimized (but not maximized), force to maximized
             if self.isVisible() and not self.isMinimized() and not self.isMaximized():
                 self._maximize_on_current_screen()
+            else:
+                self._update_grid_geometry()
         super().changeEvent(event)
     
     def _reset_component(self, component_id: int):
@@ -5293,6 +5367,7 @@ class MainWindow(QMainWindow):
             # Close the application
             if self.email_thread:
                 self.email_thread.stop()
+                self.email_thread.join(timeout=3.0)
             event.accept()
         else:
             # Cancel - keep application open
