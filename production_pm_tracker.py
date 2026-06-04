@@ -3601,6 +3601,7 @@ class MainWindow(QMainWindow):
         self.search_query = ""
         self.current_sheet_id = 1
         self.sheets = []
+        self._window_geometry_adjusting = False
         self._setup_ui()
         self._setup_tray()
         self._start_email_thread()
@@ -3608,11 +3609,31 @@ class MainWindow(QMainWindow):
         # Set window flags to allow minimize but prevent resize/restore
         self.setWindowFlags(Qt.WindowType.Window | Qt.WindowType.WindowMinimizeButtonHint | Qt.WindowType.WindowCloseButtonHint)
         
-        # Set window to start maximized
-        self.showMaximized()
+        # Start maximized for the best user experience
+        QTimer.singleShot(0, self._maximize_on_current_screen)
         
         # Force layout update after window is shown
         QTimer.singleShot(100, self._force_layout_update)
+
+    def _maximize_on_current_screen(self):
+        """Maximize the window on the current screen."""
+        if self._window_geometry_adjusting:
+            return
+
+        screen = self.screen() or QApplication.primaryScreen()
+        if not screen:
+            return
+
+        self._window_geometry_adjusting = True
+        try:
+            window_handle = self.windowHandle()
+            if window_handle:
+                window_handle.setScreen(screen)
+            self.raise_()
+            self.activateWindow()
+            self.showMaximized()
+        finally:
+            self._window_geometry_adjusting = False
     
     def _force_layout_update(self):
         """Force layout update based on current window size."""
@@ -3728,7 +3749,7 @@ class MainWindow(QMainWindow):
         sheet_tabs_widget.setFixedHeight(40)
         sheet_tabs_widget.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         sheet_tabs_layout = QHBoxLayout(sheet_tabs_widget)
-        sheet_tabs_layout.setContentsMargins(0, 0, 0, 0)
+        sheet_tabs_layout.setContentsMargins(content_margins.left() - 15, 0, 0, 0)
         sheet_tabs_layout.setSpacing(0)
         sheet_tabs_layout.addWidget(self.sheet_tabs, 0, Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
 
@@ -3938,10 +3959,6 @@ class MainWindow(QMainWindow):
         # Scrollbar is 8px wide as per stylesheet
         metrics_panel.layout().setContentsMargins(margins.left(), 0, margins.right() + 8, 0)
         
-        # Footer
-        footer = self._create_footer()
-        content_layout.addWidget(footer)
-        
         content_container.setLayout(content_layout)
         main_layout.addWidget(content_container)
         
@@ -3954,8 +3971,8 @@ class MainWindow(QMainWindow):
         header.setObjectName("headerBar")
         header.setStyleSheet(f"""
             QFrame#headerBar {{
-                background-color: #ffffff;
-                border: none;
+                background-color: {Theme.BG_CARD};
+                border-bottom: 1px solid {Theme.BORDER};
             }}
         """)
         
@@ -3998,14 +4015,14 @@ class MainWindow(QMainWindow):
             QLabel {{
                 font-size: 18px;
                 font-weight: 700;
-                color: #1c1917;
+                color: {Theme.TEXT_PRIMARY};
                 border: none;
             }}
         """)
         title_layout.addWidget(title)
         
         subtitle = QLabel("Made by Sankar | v1.0")
-        subtitle.setStyleSheet(f"QLabel {{ color: #78716c; font-size: 12px; border: none; }}")
+        subtitle.setStyleSheet(f"QLabel {{ color: {Theme.TEXT_MUTED}; font-size: 12px; border: none; }}")
         title_layout.addWidget(subtitle)
         
         title_section.addLayout(title_layout)
@@ -4022,12 +4039,12 @@ class MainWindow(QMainWindow):
         # Email config button
         email_btn = StyledButton("Email", primary=False)
         email_btn.clicked.connect(self._open_email_config)
-        # Override styling for white header background
+        # Override styling for dark header background
         email_btn.setStyleSheet(f"""
             QPushButton {{
                 background-color: transparent;
-                color: #1c1917;
-                border: 2px solid #1c1917;
+                color: {Theme.TEXT_PRIMARY};
+                border: 2px solid {Theme.BORDER};
                 border-radius: {Theme.CORNER_RADIUS}px;
                 padding: 12px 24px;
                 font-weight: 600;
@@ -4038,7 +4055,7 @@ class MainWindow(QMainWindow):
                 color: {Theme.PRIMARY};
             }}
             QPushButton:pressed {{
-                background-color: {Theme.PRIMARY_LIGHT};
+                background-color: {Theme.BG_MUTED};
             }}
         """)
         layout.addWidget(email_btn)
@@ -4264,21 +4281,6 @@ class MainWindow(QMainWindow):
         """Initialize grid layout with placeholder slots for empty state."""
         # This is now handled in _refresh_data() for dynamic placeholder management
         pass
-    
-    def _create_footer(self) -> QWidget:
-        """Create the footer section."""
-        footer = QLabel("Made by Sankar | v1.0")
-        footer.setStyleSheet(f"""
-            QLabel {{
-                color: {Theme.TEXT_MUTED};
-                font-size: 12px;
-                text-align: center;
-                padding: 8px;
-                border: none;
-            }}
-        """)
-        footer.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        return footer
     
     def _setup_tray(self):
         """Setup system tray icon."""
@@ -4543,10 +4545,14 @@ class MainWindow(QMainWindow):
     
     def resizeEvent(self, event):
         """Handle window resize events to force maximized state when restored."""
+        if self._window_geometry_adjusting:
+            super().resizeEvent(event)
+            return
+
         # Only force back to maximized if window is visible but not maximized
         # This allows minimizing but forces maximized when restored
         if self.isVisible() and not self.isMaximized():
-            self.showMaximized()
+            self._maximize_on_current_screen()
             return  # Don't process the resize event
         
         super().resizeEvent(event)
@@ -4568,10 +4574,10 @@ class MainWindow(QMainWindow):
     
     def changeEvent(self, event):
         """Handle window state changes."""
-        if event.type() == QEvent.Type.WindowStateChange:
+        if event.type() == QEvent.Type.WindowStateChange and not self._window_geometry_adjusting:
             # If window is restored from minimized (but not maximized), force to maximized
             if self.isVisible() and not self.isMinimized() and not self.isMaximized():
-                self.showMaximized()
+                self._maximize_on_current_screen()
         super().changeEvent(event)
     
     def _reset_component(self, component_id: int):
