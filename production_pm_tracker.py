@@ -31,11 +31,16 @@ from PySide6.QtWidgets import (
     QScrollArea, QFrame, QGridLayout, QMessageBox, QSystemTrayIcon,
     QMenu, QProgressBar, QSpinBox, QDoubleSpinBox, QCheckBox,
     QComboBox, QGroupBox, QSplitter, QSpacerItem, QSizePolicy, QAbstractSpinBox,
-    QTableWidget, QTableWidgetItem, QHeaderView, QTextEdit, QTabBar, QInputDialog
+    QTableWidget, QTableWidgetItem, QHeaderView, QTextEdit, QTabBar, QInputDialog,
+    QFileDialog
 )
 from PySide6.QtCore import Qt, QTimer, QSize, Signal, QObject, QEvent, QPoint
 from PySide6.QtWidgets import QDateEdit
 from PySide6.QtGui import QIcon, QPixmap, QColor, QFont, QPalette, QAction, QPainter, QPen, QBrush, QPolygon
+
+from openpyxl import Workbook
+from openpyxl.styles import Font, PatternFill, Border, Side, Alignment
+from openpyxl.utils import get_column_letter
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  THEME COLORS (Light Theme from Vercel UI)
@@ -116,10 +121,26 @@ def init_database():
                 created_at TEXT DEFAULT CURRENT_TIMESTAMP
             )
         """)
-        cursor.execute("""
-            INSERT OR IGNORE INTO sheets (id, name, created_at)
-            VALUES (1, 'Default', CURRENT_TIMESTAMP)
-        """)
+        try:
+            cursor.execute("ALTER TABLE sheets ADD COLUMN email_recipients TEXT NOT NULL DEFAULT '[]'")
+        except sqlite3.OperationalError:
+            pass
+
+        try:
+            cursor.execute("UPDATE sheets SET email_recipients = COALESCE(email_recipients, '[]')")
+        except sqlite3.OperationalError:
+            pass
+
+        try:
+            cursor.execute(
+                "INSERT OR IGNORE INTO sheets (id, name, email_recipients, created_at) VALUES (1, 'Default', ?, CURRENT_TIMESTAMP)",
+                (json.dumps([]),)
+            )
+        except sqlite3.OperationalError:
+            cursor.execute("""
+                INSERT OR IGNORE INTO sheets (id, name, created_at)
+                VALUES (1, 'Default', CURRENT_TIMESTAMP)
+            """)
         
         # Create machines table without UNIQUE constraint on name
         cursor.execute("""
@@ -381,6 +402,15 @@ def init_database():
             cursor.execute("UPDATE email_log SET sheet_id = COALESCE(sheet_id, 1)")
         except sqlite3.OperationalError:
             pass
+
+        try:
+            cursor.execute("""
+                UPDATE sheets
+                SET email_recipients = ?
+                WHERE (email_recipients IS NULL OR TRIM(email_recipients) = '')
+            """, (json.dumps([]),))
+        except Exception:
+            pass
         
         conn.commit()
 
@@ -398,26 +428,91 @@ class DatabaseManager:
                 conn.row_factory = sqlite3.Row
                 cursor = conn.cursor()
                 cursor.execute("SELECT * FROM sheets ORDER BY id")
-                return [dict(row) for row in cursor.fetchall()]
+                sheets = []
+                for row in cursor.fetchall():
+                    sheet = dict(row)
+                    raw_recipients = sheet.get("email_recipients") or "[]"
+                    try:
+                        parsed = json.loads(raw_recipients)
+                        if not isinstance(parsed, list):
+                            parsed = []
+                    except Exception:
+                        parsed = [
+                            item.strip()
+                            for item in str(raw_recipients).replace("\n", ",").split(",")
+                            if item.strip()
+                        ]
+                    sheet["email_recipients"] = parsed
+                    sheet["to_addrs"] = parsed
+                    sheets.append(sheet)
+                return sheets
         except Exception as e:
             print(f"Error getting sheets: {e}")
             return []
 
     @staticmethod
-    def add_sheet(name: str) -> Optional[int]:
+    def get_sheet_by_id(sheet_id: int) -> Optional[Dict]:
+        """Get a single sheet by its id."""
+        try:
+            with get_db_connection() as conn:
+                conn.row_factory = sqlite3.Row
+                cursor = conn.cursor()
+                cursor.execute("SELECT * FROM sheets WHERE id = ?", (sheet_id,))
+                row = cursor.fetchone()
+                if not row:
+                    return None
+                sheet = dict(row)
+                raw_recipients = sheet.get("email_recipients") or "[]"
+                try:
+                    parsed = json.loads(raw_recipients)
+                    if not isinstance(parsed, list):
+                        parsed = []
+                except Exception:
+                    parsed = [
+                        item.strip()
+                        for item in str(raw_recipients).replace("\n", ",").split(",")
+                        if item.strip()
+                    ]
+                sheet["email_recipients"] = parsed
+                sheet["to_addrs"] = parsed
+                return sheet
+        except Exception as e:
+            print(f"Error getting sheet {sheet_id}: {e}")
+            return None
+
+    @staticmethod
+    def add_sheet(name: str, email_recipients: Optional[List[str]] = None) -> Optional[int]:
         """Add a new sheet tab."""
         try:
             with get_db_connection() as conn:
                 cursor = conn.cursor()
+                if email_recipients is None:
+                    email_recipients = []
                 cursor.execute(
-                    "INSERT INTO sheets (name) VALUES (?)",
-                    (name.strip(),)
+                    "INSERT INTO sheets (name, email_recipients) VALUES (?, ?)",
+                    (name.strip(), json.dumps(email_recipients))
                 )
                 conn.commit()
                 return cursor.lastrowid
         except Exception as e:
             print(f"Error adding sheet: {e}")
             return None
+
+    @staticmethod
+    def update_sheet_recipients(sheet_id: int, email_recipients: List[str]) -> bool:
+        """Update a sheet's recipient list."""
+        try:
+            with get_db_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute(
+                    "UPDATE sheets SET email_recipients = ? WHERE id = ?",
+                    (json.dumps(email_recipients), sheet_id)
+                )
+                conn.commit()
+                return cursor.rowcount > 0
+        except Exception as e:
+            print(f"Error updating sheet recipients: {e}")
+            return False
 
     @staticmethod
     def update_sheet_name(sheet_id: int, new_name: str) -> bool:
@@ -1402,7 +1497,7 @@ class EmailNotificationThread(threading.Thread):
         """Check for components due soon and send emails."""
         config = EmailConfig.load_config()
         
-        if not config.get('enabled') or not config.get('to_addrs'):
+        if not config.get('enabled'):
             return
         
         today = date.today().isoformat()
@@ -1421,11 +1516,17 @@ class EmailNotificationThread(threading.Thread):
             if not due_components:
                 continue
 
+            sheet_recipients = sheet.get("email_recipients") or []
+            if not sheet_recipients:
+                continue
+
             if not DatabaseManager.claim_daily_email(today, sheet_id):
                 continue
 
             subject, html = EmailConfig.build_alert_email(due_components, sheet_name=sheet_name)
-            success, error = EmailConfig.send_email(config, subject, html)
+            send_config = config.copy()
+            send_config["to_addrs"] = sheet_recipients
+            success, error = EmailConfig.send_email(send_config, subject, html)
 
             if success:
                 DatabaseManager.mark_email_sent(
@@ -2306,11 +2407,14 @@ class SheetManagementDialog(QDialog):
         hint.setStyleSheet(f"QLabel {{ color: {Theme.TEXT_MUTED}; font-size: 13px; border: none; }}")
         layout.addWidget(hint)
 
-        self.table = QTableWidget(0, 3)
-        self.table.setHorizontalHeaderLabels(["ID", "Sheet", "Items"])
+        self.table = QTableWidget(0, 4)
+        self.table.setHorizontalHeaderLabels(["ID", "Sheet", "Items", "Recipients"])
         self.table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
         self.table.setSelectionMode(QTableWidget.SelectionMode.SingleSelection)
         self.table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        self.table.cellDoubleClicked.connect(self._handle_cell_double_click)
+        self.table.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.table.customContextMenuRequested.connect(self._show_context_menu)
         self.table.verticalHeader().setVisible(False)
         self.table.setStyleSheet(f"""
             QTableWidget {{
@@ -2332,6 +2436,7 @@ class SheetManagementDialog(QDialog):
         header.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
         header.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
         header.setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
         layout.addWidget(self.table, 1)
 
         button_row = QHBoxLayout()
@@ -2344,6 +2449,10 @@ class SheetManagementDialog(QDialog):
         self.delete_btn = StyledButton("Delete", primary=False)
         self.delete_btn.clicked.connect(self._delete_selected)
         button_row.addWidget(self.delete_btn)
+
+        self.recipients_btn = StyledButton("Recipients", primary=False)
+        self.recipients_btn.clicked.connect(self._edit_recipients)
+        button_row.addWidget(self.recipients_btn)
 
         close_btn = StyledButton("Close", primary=False)
         close_btn.clicked.connect(self.reject)
@@ -2358,16 +2467,21 @@ class SheetManagementDialog(QDialog):
         for row_index, sheet in enumerate(sheets):
             sheet_id = sheet.get("id", 1)
             item_count = self._count_items(sheet_id)
+            recipients = sheet.get("email_recipients") or []
+            recipients_text = f"{len(recipients)} recipient(s)" if recipients else "No recipients"
 
             id_item = QTableWidgetItem(str(sheet_id))
             id_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
             name_item = QTableWidgetItem(sheet.get("name", "Sheet"))
             items_item = QTableWidgetItem(str(item_count))
             items_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+            recipients_item = QTableWidgetItem(recipients_text)
+            recipients_item.setData(Qt.ItemDataRole.UserRole, recipients)
 
             self.table.setItem(row_index, 0, id_item)
             self.table.setItem(row_index, 1, name_item)
             self.table.setItem(row_index, 2, items_item)
+            self.table.setItem(row_index, 3, recipients_item)
 
     def _count_items(self, sheet_id: int) -> int:
         machines = DatabaseManager.get_all_machines(sheet_id)
@@ -2388,7 +2502,66 @@ class SheetManagementDialog(QDialog):
             sheet_id = int(sheet_id_item.text())
         except ValueError:
             return None
-        return {"id": sheet_id, "name": name_item.text()}
+        recipients_item = self.table.item(row, 3)
+        recipients_text = recipients_item.data(Qt.ItemDataRole.UserRole) if recipients_item else []
+        if not isinstance(recipients_text, list):
+            recipients_text = []
+        return {
+            "id": sheet_id,
+            "name": name_item.text(),
+            "email_recipients": recipients_text,
+        }
+
+    def _sheet_at_row(self, row: int) -> Optional[Dict]:
+        if row < 0 or row >= self.table.rowCount():
+            return None
+        sheet_id_item = self.table.item(row, 0)
+        name_item = self.table.item(row, 1)
+        if not sheet_id_item or not name_item:
+            return None
+        try:
+            sheet_id = int(sheet_id_item.text())
+        except ValueError:
+            return None
+        recipients_item = self.table.item(row, 3)
+        recipients_text = recipients_item.data(Qt.ItemDataRole.UserRole) if recipients_item else []
+        if not isinstance(recipients_text, list):
+            recipients_text = []
+        return {
+            "id": sheet_id,
+            "name": name_item.text(),
+            "email_recipients": recipients_text,
+        }
+
+    def _select_row(self, row: int):
+        if row < 0 or row >= self.table.rowCount():
+            return
+        self.table.selectRow(row)
+
+    def _handle_cell_double_click(self, row: int, column: int):
+        if column == 1:
+            self._select_row(row)
+            self._rename_selected()
+
+    def _show_context_menu(self, pos):
+        index = self.table.indexAt(pos)
+        if not index.isValid():
+            return
+
+        row = index.row()
+        self._select_row(row)
+        sheet = self._sheet_at_row(row)
+        if not sheet:
+            return
+
+        menu = QMenu(self)
+        rename_action = QAction("Rename", self)
+        delete_action = QAction("Delete", self)
+        rename_action.triggered.connect(self._rename_selected)
+        delete_action.triggered.connect(self._delete_selected)
+        menu.addAction(rename_action)
+        menu.addAction(delete_action)
+        menu.exec(self.table.viewport().mapToGlobal(pos))
 
     def _rename_selected(self):
         sheet = self._selected_sheet()
@@ -2415,6 +2588,30 @@ class SheetManagementDialog(QDialog):
 
         if not DatabaseManager.update_sheet_name(sheet["id"], new_name):
             QMessageBox.warning(self, "Rename Failed", "Could not rename the sheet.")
+            return
+
+        self._load_sheets()
+        self._refresh_parent()
+
+    def _edit_recipients(self):
+        sheet = self._selected_sheet()
+        if not sheet:
+            return
+
+        current = sheet.get("email_recipients") or []
+        current_text = ", ".join(current)
+        text, accepted = QInputDialog.getMultiLineText(
+            self,
+            "Sheet Recipients",
+            "Enter comma-separated email recipients for this sheet:",
+            current_text
+        )
+        if not accepted:
+            return
+
+        recipients = [item.strip() for item in text.replace("\n", ",").split(",") if item.strip()]
+        if not DatabaseManager.update_sheet_recipients(sheet["id"], recipients):
+            QMessageBox.warning(self, "Update Failed", "Could not update sheet recipients.")
             return
 
         self._load_sheets()
@@ -3331,13 +3528,16 @@ class AddEquipmentDialog(QDialog):
 class EmailConfigDialog(QDialog):
     """Dialog for configuring email settings."""
     
-    def __init__(self, parent=None):
+    def __init__(self, parent=None, sheet_id: Optional[int] = None):
         super().__init__(parent)
+        self.sheet_id = sheet_id if sheet_id is not None else getattr(parent, "current_sheet_id", 1)
+        self.sheet_data = DatabaseManager.get_sheet_by_id(self.sheet_id) or {"name": "Sheet", "email_recipients": []}
         self.config = EmailConfig.load_config()
         self._setup_ui()
     
     def _setup_ui(self):
-        self.setWindowTitle("Email Configuration")
+        sheet_name = self.sheet_data.get("name", "Sheet")
+        self.setWindowTitle(f"Email Configuration - {sheet_name}")
         self.setMinimumWidth(500)
         self.setStyleSheet(f"""
             QDialog {{
@@ -3350,7 +3550,7 @@ class EmailConfigDialog(QDialog):
         layout.setSpacing(16)
         
         # Title
-        title = QLabel("Email Configuration")
+        title = QLabel(f"Email Configuration - {sheet_name}")
         title.setStyleSheet(f"""
             QLabel {{
                 font-size: 20px;
@@ -3433,12 +3633,12 @@ class EmailConfigDialog(QDialog):
         layout.addWidget(self.from_input)
         
         # To Addresses
-        to_label = QLabel("To Email Addresses (comma separated):")
+        to_label = QLabel("Recipients for this sheet (comma separated):")
         to_label.setStyleSheet(f"QLabel {{ color: {Theme.TEXT_PRIMARY}; font-weight: 600; font-size: 14px; border: none; }}")
         layout.addWidget(to_label)
         
         self.to_input = StyledLineEdit()
-        self.to_input.setText(', '.join(self.config.get('to_addrs', [])))
+        self.to_input.setText(', '.join(self.sheet_data.get('email_recipients', [])))
         layout.addWidget(self.to_input)
         
         # Buttons
@@ -3462,6 +3662,7 @@ class EmailConfigDialog(QDialog):
     
     def _save(self):
         """Save the email configuration."""
+        recipients = [addr.strip() for addr in self.to_input.text().split(',') if addr.strip()]
         config = {
             'enabled': self.enable_checkbox.isChecked(),
             'smtp_host': self.host_input.text().strip(),
@@ -3469,10 +3670,10 @@ class EmailConfigDialog(QDialog):
             'smtp_user': self.user_input.text().strip(),
             'smtp_password': self.pass_input.text().strip(),
             'from_addr': self.from_input.text().strip(),
-            'to_addrs': [addr.strip() for addr in self.to_input.text().split(',') if addr.strip()]
+            'to_addrs': []
         }
         
-        if EmailConfig.save_config(config):
+        if EmailConfig.save_config(config) and DatabaseManager.update_sheet_recipients(self.sheet_id, recipients):
             self._show_success_message("Email configuration saved successfully!")
             self.accept()
         else:
@@ -3744,6 +3945,8 @@ class MainWindow(QMainWindow):
             }}
         """)
         self.sheet_tabs.currentChanged.connect(self._on_sheet_changed)
+        self.sheet_tabs.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.sheet_tabs.customContextMenuRequested.connect(self._show_sheet_tab_context_menu)
 
         sheet_tabs_widget = QWidget()
         sheet_tabs_widget.setFixedHeight(40)
@@ -3792,6 +3995,26 @@ class MainWindow(QMainWindow):
         """)
         self.manage_sheets_btn.clicked.connect(self._manage_sheets)
         sheet_row.addWidget(self.manage_sheets_btn)
+
+        self.export_sheet_btn = StyledButton("Export", primary=False)
+        self.export_sheet_btn.setFixedHeight(36)
+        self.export_sheet_btn.setStyleSheet(f"""
+            QPushButton {{
+                background-color: transparent;
+                color: {Theme.TEXT_PRIMARY};
+                border: 1px solid {Theme.BORDER};
+                border-radius: 10px;
+                padding: 0px 14px;
+                font-weight: 600;
+                font-size: 12px;
+            }}
+            QPushButton:hover {{
+                border-color: {Theme.PRIMARY};
+                color: {Theme.PRIMARY};
+            }}
+        """)
+        self.export_sheet_btn.clicked.connect(self._export_current_sheet)
+        sheet_row.addWidget(self.export_sheet_btn)
 
         sheet_widget = QWidget()
         sheet_widget.setLayout(sheet_row)
@@ -4259,11 +4482,349 @@ class MainWindow(QMainWindow):
                 self.sheet_tabs.setCurrentIndex(index)
                 break
 
+    def _show_sheet_tab_context_menu(self, pos):
+        """Show rename/delete options for a sheet tab."""
+        index = self.sheet_tabs.tabAt(pos)
+        if index < 0:
+            return
+
+        self.sheet_tabs.setCurrentIndex(index)
+        sheet_id = self.sheet_tabs.tabData(index)
+        if not sheet_id:
+            return
+
+        sheet_name = self.sheet_tabs.tabText(index)
+
+        menu = QMenu(self)
+        rename_action = QAction("Rename", self)
+        delete_action = QAction("Delete", self)
+        rename_action.triggered.connect(lambda: self._rename_sheet_by_id(sheet_id, sheet_name))
+        delete_action.triggered.connect(lambda: self._delete_sheet_by_id(sheet_id, sheet_name))
+        menu.addAction(rename_action)
+        menu.addAction(delete_action)
+        menu.exec(self.sheet_tabs.mapToGlobal(pos))
+
+    def _rename_sheet_by_id(self, sheet_id: int, current_name: str):
+        """Rename a sheet using its id."""
+        new_name, accepted = QInputDialog.getText(
+            self,
+            "Rename Sheet",
+            "Enter a new sheet name:",
+            QLineEdit.EchoMode.Normal,
+            current_name
+        )
+        if not accepted:
+            return
+
+        new_name = new_name.strip()
+        if not new_name:
+            QMessageBox.warning(self, "Invalid Name", "Please enter a sheet name.")
+            return
+
+        if new_name == current_name:
+            return
+
+        if not DatabaseManager.update_sheet_name(sheet_id, new_name):
+            QMessageBox.warning(self, "Rename Failed", "Could not rename the sheet.")
+            return
+
+        self._load_sheet_tabs()
+
+    def _delete_sheet_by_id(self, sheet_id: int, sheet_name: str):
+        """Delete a sheet using its id."""
+        if sheet_id == 1:
+            QMessageBox.information(self, "Default Sheet", "The Default sheet cannot be deleted.")
+            return
+
+        msg_box = QMessageBox(self)
+        msg_box.setWindowTitle("Delete Sheet")
+        msg_box.setText(
+            f"Delete '{sheet_name}' and all equipment, components, maintenance logs, and reminder history inside it?"
+        )
+        msg_box.setStandardButtons(QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+        msg_box.setStyleSheet(f"""
+            QMessageBox {{
+                background-color: {Theme.BG_PRIMARY};
+                color: {Theme.TEXT_PRIMARY};
+            }}
+            QLabel {{
+                color: {Theme.TEXT_PRIMARY};
+                background: transparent;
+                border: none;
+                font-size: 14px;
+            }}
+            QPushButton {{
+                background-color: {Theme.BG_CARD};
+                color: {Theme.TEXT_PRIMARY};
+                border: 1px solid {Theme.BORDER};
+                border-radius: 6px;
+                padding: 6px 16px;
+                min-width: 70px;
+                font-size: 13px;
+            }}
+            QPushButton:hover {{
+                background-color: {Theme.BG_MUTED};
+                border-color: {Theme.TEXT_MUTED};
+            }}
+        """)
+        if msg_box.exec() != QMessageBox.StandardButton.Yes:
+            return
+
+        if DatabaseManager.delete_sheet(sheet_id):
+            self._load_sheet_tabs()
+        else:
+            QMessageBox.warning(self, "Delete Failed", "Could not delete the selected sheet.")
+
     def _manage_sheets(self):
         """Open the sheet management dialog."""
         dialog = SheetManagementDialog(self)
         dialog.exec()
-    
+
+    def _export_current_sheet(self):
+        """Export the active sheet's data to a formatted Excel workbook."""
+        sheet = DatabaseManager.get_sheet_by_id(self.current_sheet_id)
+        sheet_name = sheet.get("name", "Sheet") if sheet else "Sheet"
+        safe_sheet_name = "".join(ch if ch.isalnum() or ch in (" ", "_", "-") else "_" for ch in sheet_name).strip() or "Sheet"
+
+        default_path = os.path.join(get_base_path(), f"{safe_sheet_name}_PM_Export.xlsx")
+        file_path, _ = QFileDialog.getSaveFileName(
+            self,
+            "Export Sheet to Excel",
+            default_path,
+            "Excel Workbook (*.xlsx)"
+        )
+        if not file_path:
+            return
+
+        if not file_path.lower().endswith(".xlsx"):
+            file_path += ".xlsx"
+
+        try:
+            machines = DatabaseManager.get_all_machines(self.current_sheet_id)
+            components = []
+            for machine in machines:
+                for component in machine.get("components", []):
+                    comp = dict(component)
+                    comp["machine_name"] = machine.get("name", "")
+                    comp["machine_serial_number"] = machine.get("serial_number", "")
+                    comp["machine_location"] = machine.get("location", "")
+                    components.append(comp)
+
+            logs = DatabaseManager.get_maintenance_history(sheet_id=self.current_sheet_id)
+            due_components = DatabaseManager.get_components_due_soon(self.current_sheet_id)
+
+            wb = Workbook()
+            ws_overview = wb.active
+            ws_overview.title = "Overview"
+            ws_equipment = wb.create_sheet("Equipment")
+            ws_components = wb.create_sheet("Components")
+            ws_logs = wb.create_sheet("Logs")
+
+            title_fill = PatternFill("solid", fgColor="1E293B")
+            header_fill = PatternFill("solid", fgColor="3B82F6")
+            subheader_fill = PatternFill("solid", fgColor="334155")
+            alt_fill = PatternFill("solid", fgColor="F8FAFC")
+            white_font = Font(color="FFFFFF", bold=True)
+            dark_font = Font(color="0F172A")
+            header_border = Border(
+                left=Side(style="thin", color="CBD5E1"),
+                right=Side(style="thin", color="CBD5E1"),
+                top=Side(style="thin", color="CBD5E1"),
+                bottom=Side(style="thin", color="CBD5E1"),
+            )
+            thin_border = Border(
+                left=Side(style="thin", color="E2E8F0"),
+                right=Side(style="thin", color="E2E8F0"),
+                top=Side(style="thin", color="E2E8F0"),
+                bottom=Side(style="thin", color="E2E8F0"),
+            )
+
+            def style_title(ws, title_text):
+                ws.merge_cells("A1:F1")
+                cell = ws["A1"]
+                cell.value = title_text
+                cell.fill = title_fill
+                cell.font = Font(color="FFFFFF", bold=True, size=14)
+                cell.alignment = Alignment(horizontal="left", vertical="center")
+                ws.row_dimensions[1].height = 24
+
+            def style_meta_rows(ws, rows):
+                for row_idx, label, value in rows:
+                    ws[f"A{row_idx}"] = label
+                    ws[f"A{row_idx}"].font = Font(bold=True, color="334155")
+                    ws[f"B{row_idx}"] = value
+                    ws[f"B{row_idx}"].font = Font(color="0F172A")
+                    ws[f"A{row_idx}"].fill = subheader_fill
+                    ws[f"B{row_idx}"].fill = PatternFill("solid", fgColor="FFFFFF")
+                    ws[f"A{row_idx}"].border = thin_border
+                    ws[f"B{row_idx}"].border = thin_border
+                    ws[f"A{row_idx}"].alignment = Alignment(horizontal="left", vertical="center")
+                    ws[f"B{row_idx}"].alignment = Alignment(horizontal="left", vertical="center")
+
+            def format_table(ws, headers, rows, start_row=1, freeze_row=None):
+                for col_idx, header in enumerate(headers, 1):
+                    cell = ws.cell(row=start_row, column=col_idx, value=header)
+                    cell.fill = header_fill
+                    cell.font = white_font
+                    cell.border = header_border
+                    cell.alignment = Alignment(horizontal="center", vertical="center")
+
+                for r_idx, row in enumerate(rows, start_row + 1):
+                    row_fill = alt_fill if (r_idx - start_row) % 2 == 1 else PatternFill("solid", fgColor="FFFFFF")
+                    for c_idx, value in enumerate(row, 1):
+                        cell = ws.cell(row=r_idx, column=c_idx, value=value)
+                        cell.fill = row_fill
+                        cell.font = dark_font
+                        cell.border = thin_border
+                        if c_idx in (1, 2, 3, 5, 6, 7, 8):
+                            cell.alignment = Alignment(horizontal="center", vertical="top", wrap_text=True)
+                        else:
+                            cell.alignment = Alignment(horizontal="left", vertical="top", wrap_text=True)
+
+                end_row = start_row + len(rows)
+                ws.auto_filter.ref = f"A{start_row}:{get_column_letter(len(headers))}{max(end_row, start_row)}"
+                if freeze_row:
+                    ws.freeze_panes = freeze_row
+
+            def set_widths(ws, widths):
+                for col_letter, width in widths.items():
+                    ws.column_dimensions[col_letter].width = width
+
+            # Overview
+            style_title(ws_overview, f"Equipment PM Export - {sheet_name}")
+            overview_rows = [
+                (3, "Sheet Name", sheet_name),
+                (4, "Exported On", datetime.now().strftime("%Y-%m-%d %H:%M:%S")),
+                (5, "Equipment Count", len(machines)),
+                (6, "Component Count", len(components)),
+                (7, "Due Soon / Overdue", len(due_components)),
+                (8, "Maintenance Logs", len(logs)),
+            ]
+            style_meta_rows(ws_overview, overview_rows)
+            ws_overview["A10"] = "Quick Summary"
+            ws_overview["A10"].font = Font(bold=True, color="FFFFFF")
+            ws_overview["A10"].fill = header_fill
+            ws_overview["A10"].alignment = Alignment(horizontal="left")
+            ws_overview.merge_cells("A10:B10")
+            ws_overview["A11"] = (
+                "The workbook includes an equipment summary, a detailed component list, "
+                "and the maintenance log history for this sheet."
+            )
+            ws_overview["A11"].alignment = Alignment(wrap_text=True, vertical="top")
+            ws_overview["A11"].border = thin_border
+            ws_overview.merge_cells("A11:F13")
+            ws_overview.row_dimensions[11].height = 42
+            set_widths(ws_overview, {"A": 22, "B": 40, "C": 16, "D": 16, "E": 16, "F": 16})
+
+            # Equipment
+            equipment_rows = []
+            for machine in machines:
+                machine_components = machine.get("components", [])
+                soonest = min((c.get("days_remaining", 0) for c in machine_components), default=None)
+                status = "No components"
+                if machine_components:
+                    if any(c.get("days_remaining", 0) <= 0 for c in machine_components):
+                        status = "Attention"
+                    elif any(0 < c.get("days_remaining", 0) <= c.get("alert_threshold_days", 5) for c in machine_components):
+                        status = "Upcoming"
+                    else:
+                        status = "Healthy"
+
+                component_lines = []
+                for comp in machine_components:
+                    component_lines.append(
+                        f"{comp.get('component_name', 'Component')} - {comp.get('days_remaining', 0)}d left"
+                    )
+
+                equipment_rows.append([
+                    machine.get("name", ""),
+                    machine.get("serial_number", ""),
+                    machine.get("location", ""),
+                    "\n".join(component_lines) if component_lines else "No components",
+                    soonest if soonest is not None else "",
+                    status,
+                ])
+
+            format_table(
+                ws_equipment,
+                ["Equipment", "Serial Number", "Location", "Components", "Soonest Due", "Status"],
+                equipment_rows,
+                start_row=1,
+                freeze_row="A2"
+            )
+            set_widths(ws_equipment, {"A": 26, "B": 18, "C": 18, "D": 48, "E": 14, "F": 16})
+
+            # Components
+            component_rows = []
+            for comp in components:
+                component_rows.append([
+                    comp.get("machine_name", ""),
+                    comp.get("machine_serial_number", ""),
+                    comp.get("machine_location", ""),
+                    comp.get("component_name", ""),
+                    comp.get("pm_interval_days", ""),
+                    comp.get("alert_threshold_days", ""),
+                    comp.get("last_performed_date") or "",
+                    comp.get("next_due_date") or "",
+                    comp.get("days_remaining", ""),
+                    comp.get("custom_start_date") or "",
+                ])
+
+            format_table(
+                ws_components,
+                [
+                    "Equipment", "Serial Number", "Location", "Component", "Interval (Days)",
+                    "Alert (Days)", "Last Performed", "Next Due", "Days Left", "Custom Start"
+                ],
+                component_rows,
+                start_row=1,
+                freeze_row="A2"
+            )
+            set_widths(ws_components, {
+                "A": 24, "B": 16, "C": 18, "D": 22, "E": 14,
+                "F": 12, "G": 14, "H": 14, "I": 12, "J": 14
+            })
+
+            # Logs
+            log_rows = []
+            for log in logs:
+                log_rows.append([
+                    log.get("maintenance_date", ""),
+                    log.get("machine_name", ""),
+                    log.get("machine_serial_number", ""),
+                    log.get("component_name", ""),
+                    log.get("notes") or "",
+                ])
+
+            format_table(
+                ws_logs,
+                ["Date", "Equipment", "Serial Number", "Component", "Notes"],
+                log_rows,
+                start_row=1,
+                freeze_row="A2"
+            )
+            set_widths(ws_logs, {"A": 14, "B": 24, "C": 16, "D": 22, "E": 52})
+
+            for ws in (ws_overview, ws_equipment, ws_components, ws_logs):
+                ws.sheet_view.showGridLines = False
+
+            wb.save(file_path)
+
+            open_now = QMessageBox.question(
+                self,
+                "Export Complete",
+                "Sheet exported successfully. Open the file now?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No
+            )
+            if open_now == QMessageBox.StandardButton.Yes:
+                try:
+                    os.startfile(file_path)
+                except Exception as open_error:
+                    QMessageBox.warning(self, "Open Failed", f"Could not open the exported file:\n{open_error}")
+        except Exception as e:
+            QMessageBox.warning(self, "Export Failed", f"Could not export the sheet:\n{e}")
+
     def _create_empty_slot(self) -> QWidget:
         """Create an empty placeholder for a grid slot."""
         placeholder = QWidget()
@@ -4405,7 +4966,7 @@ class MainWindow(QMainWindow):
     
     def _open_email_config(self):
         """Open the email configuration dialog."""
-        dialog = EmailConfigDialog(self)
+        dialog = EmailConfigDialog(self, sheet_id=self.current_sheet_id)
         dialog.exec()
     
     def _refresh_data(self):
