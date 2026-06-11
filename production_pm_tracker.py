@@ -2741,7 +2741,7 @@ class EquipmentCard(StyledCard):
     def __init__(self, machine_data: Dict, parent=None):
         super().__init__(parent)
         self.machine_data = machine_data
-        self.setFixedHeight(320)
+        self.setMinimumHeight(320)
         self._setup_ui()
         self._apply_hover_style()
         
@@ -2855,7 +2855,7 @@ class EquipmentCard(StyledCard):
         if components:
             for component in components:
                 row = ComponentRow(component)
-                row.setFixedHeight(45)
+                row.setMinimumHeight(45)
                 row.reset_clicked.connect(self.reset_component.emit)
                 row.delete_clicked.connect(self._delete_component)
                 components_layout.addWidget(row)
@@ -3901,6 +3901,7 @@ class MainWindow(QMainWindow):
     def _force_layout_update(self):
         """Force layout update based on current window size."""
         self._update_grid_geometry()
+        self._layout_metric_cards(self._responsive_column_count())
         self._refresh_data()
     
     def _setup_ui(self):
@@ -4355,10 +4356,6 @@ class MainWindow(QMainWindow):
         layout.setSpacing(16)
         layout.setContentsMargins(0, 0, 0, 0)
         
-        # Set uniform column stretches to match equipment cards grid
-        for i in range(3):  # 3 columns to match equipment grid
-            layout.setColumnStretch(i, 1)
-        
         # Total Equipment
         total_card = self._create_metric_card(
             "Total Equipment", 
@@ -4393,9 +4390,45 @@ class MainWindow(QMainWindow):
         self.warning_label = self.warning_card.findChild(QLabel, "metric_value")
         self.warning_card.clicked.connect(lambda: self._toggle_metric_filter("warning"))
         layout.addWidget(self.warning_card, 0, 2)
-        
+
+        self.metric_cards = [total_card, self.critical_card, self.warning_card]
+        self.metric_cards_layout = layout
         panel.setLayout(layout)
+        self._layout_metric_cards(self._responsive_column_count())
         return panel
+
+    def _responsive_column_count(self) -> int:
+        """Return the preferred card column count for the current width."""
+        width = self.scroll_area.viewport().width() if hasattr(self, "scroll_area") and self.scroll_area else self.width()
+        if width < 960:
+            return 1
+        if width < 1480:
+            return 2
+        return 3
+
+    def _layout_metric_cards(self, column_count: int) -> None:
+        """Reflow the metric cards into a responsive grid."""
+        if not hasattr(self, "metric_cards_layout"):
+            return
+
+        layout = self.metric_cards_layout
+        while layout.count():
+            item = layout.takeAt(0)
+            if not item:
+                continue
+            widget = item.widget()
+            if widget:
+                widget.setParent(None)
+
+        for col in range(3):
+            layout.setColumnStretch(col, 0)
+        for col in range(max(column_count, 1)):
+            layout.setColumnStretch(col, 1)
+
+        for index, card in enumerate(getattr(self, "metric_cards", [])):
+            row = index // column_count
+            col = index % column_count
+            layout.addWidget(card, row, col)
     
     def _create_metric_card(self, title: str, value: str, bg_color: str, text_color: str, icon: str = "📊") -> QWidget:
         """Create a single metric card."""
@@ -4595,7 +4628,12 @@ class MainWindow(QMainWindow):
                 viewport_width = viewport.width()
 
         available_width = max(viewport_width, self.width())
-        target_columns = 3 if available_width >= self.WIDTH_THRESHOLD else 2
+        if available_width < 960:
+            target_columns = 1
+        elif available_width < self.WIDTH_THRESHOLD:
+            target_columns = 2
+        else:
+            target_columns = 3
         self.target_columns = target_columns
         self.current_columns = target_columns
         return target_columns
@@ -4737,7 +4775,7 @@ class MainWindow(QMainWindow):
             def write_info_block(ws, rows, start_row=4):
                 for row_idx, label, value in rows:
                     ws[f"A{row_idx}"] = label
-                    ws[f"A{row_idx}"].font = Font(bold=True, color="334155")
+                    ws[f"A{row_idx}"].font = Font(bold=True, color="FFFFFF")
                     ws[f"A{row_idx}"].fill = subheader_fill
                     ws[f"A{row_idx}"].border = thin_border
                     ws[f"A{row_idx}"].alignment = Alignment(horizontal="left", vertical="center")
@@ -4801,15 +4839,16 @@ class MainWindow(QMainWindow):
                 )
 
                 info_rows = [
-                    (4, "Serial Number", machine.get("serial_number") or "N/A"),
-                    (5, "Location", machine.get("location") or "N/A"),
-                    (6, "Status", current_status),
-                    (7, "Components", str(len(machine_components))),
-                    (8, "Soonest Due", format_date_for_display((min((c.get('next_due_date') for c in machine_components if c.get('next_due_date')), default=None))) if machine_components else "N/A"),
+                    (4, "Equipment", machine.get("name") or "N/A"),
+                    (5, "Serial Number", machine.get("serial_number") or "N/A"),
+                    (6, "Location", machine.get("location") or "N/A"),
+                    (7, "Status", current_status),
+                    (8, "Components", str(len(machine_components))),
+                    (9, "Soonest Due", format_date_for_display((min((c.get('next_due_date') for c in machine_components if c.get('next_due_date')), default=None))) if machine_components else "N/A"),
                 ]
                 write_info_block(ws, info_rows)
 
-                component_start = 10
+                component_start = 11
                 ws.merge_cells(start_row=component_start, start_column=1, end_row=component_start, end_column=8)
                 comp_title = ws.cell(component_start, 1, "Current Components")
                 comp_title.fill = header_fill
@@ -4914,7 +4953,7 @@ class MainWindow(QMainWindow):
     def _create_empty_slot(self) -> QWidget:
         """Create an empty placeholder for a grid slot."""
         placeholder = QWidget()
-        placeholder.setFixedHeight(320)  # Match equipment card height
+        placeholder.setMinimumHeight(320)  # Match equipment card height
         placeholder.setStyleSheet(f"""
             QWidget {{
                 background-color: transparent;
@@ -5197,6 +5236,7 @@ class MainWindow(QMainWindow):
         super().resizeEvent(event)
         
         target_columns = self._update_grid_geometry()
+        self._layout_metric_cards(self._responsive_column_count())
 
         # Only refresh if column count changed
         if target_columns != self.previous_columns:
@@ -5213,6 +5253,7 @@ class MainWindow(QMainWindow):
                 self._maximize_on_current_screen()
             else:
                 self._update_grid_geometry()
+                self._layout_metric_cards(self._responsive_column_count())
         super().changeEvent(event)
     
     def _reset_component(self, component_id: int):
